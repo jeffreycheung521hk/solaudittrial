@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .evidence import CallEvidence, EvidenceRef, EvidenceStore, utc_now
-from .rpc import RETRYABLE_RPC_CODES, TokenBucket
+from .ratelimit import TokenBucket
+from .solana_codes import is_retryable
 
 FINALIZED = "finalized"
 TOKEN_ACCOUNT_ENCODING = "base64"
@@ -398,7 +399,7 @@ class AuditRpcClient:
                     code = raw_error.get("code")
                     error_code = code if isinstance(code, int) else None
                     error_message = str(raw_error.get("message", "RPC error"))
-                    retryable = error_code in RETRYABLE_RPC_CODES
+                    retryable = is_retryable(error_code)
                 else:
                     error_message = "JSON-RPC error object is malformed"
             elif "result" not in envelope:
