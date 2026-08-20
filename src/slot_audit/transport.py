@@ -188,6 +188,14 @@ class AuditRpcClient:
     retry keeps one transient ``-32005`` from being recorded as missing data; a
     hard budget keeps a runaway loop from quietly spending someone's quota.
     Every attempt is retained, so retries are visible rather than smoothed away.
+
+    **Calls are issued one at a time, by design.** This tool is rate-limited, not
+    latency-bound, so concurrency would buy little; and it would cost two things
+    the instrument actually argues from. The evidence store's write order is what
+    demonstrates that the provider-only inference was frozen before the anchor
+    was read, and interleaved writes would blur it. Replay matches recorded
+    responses to requests in order, so deterministic sequencing is what makes
+    that matching sound rather than lucky. There is deliberately no semaphore.
     """
 
     def __init__(
@@ -201,7 +209,6 @@ class AuditRpcClient:
         commitment: str = FINALIZED,
         clock: Callable[[], str] = utc_now,
         rps: float | None = None,
-        max_concurrency: int = 8,
         max_requests: int | None = None,
         max_retries: int = MAX_RETRIES,
         backoff_base: float = 0.25,
@@ -216,8 +223,6 @@ class AuditRpcClient:
             raise ValueError("provider URL must not be empty")
         if not 0 <= max_retries <= MAX_RETRIES:
             raise ValueError(f"max_retries must be between 0 and {MAX_RETRIES}")
-        if max_concurrency < 1:
-            raise ValueError("max_concurrency must be at least one")
         if max_requests is not None and max_requests < 1:
             raise ValueError("max_requests must be at least one when set")
         if rps is not None and rps <= 0:
@@ -235,7 +240,6 @@ class AuditRpcClient:
         self._clock = clock
         self._sleep = sleep
         self._random = random_source or random.Random(0)
-        self._semaphore = asyncio.Semaphore(max_concurrency)
         self._bucket = (
             None if rps is None else TokenBucket(rps, sleep=sleep, clock=monotonic)
         )
@@ -346,33 +350,30 @@ class AuditRpcClient:
             "method": method,
             "params": list(params),
         }
-        async with self._semaphore:
-            # Queue for concurrency before consuming a rate token, so slow calls
-            # cannot let queued work pre-fill the bucket and burst on release.
-            if self._bucket is not None:
-                await self._bucket.acquire()
-            self.attempt_count += 1
-            started_at = self._clock()
-            try:
-                response = await self._transport.post(self._url, payload)
-            except TransportError as exc:
-                evidence = self._record_synthetic(
-                    method,
-                    params,
-                    payload={"transport_error": str(exc)},
-                    error=str(exc),
-                )
-                return (
-                    RecordedCall(
-                        method=method,
-                        provider=self.provider,
-                        result=None,
-                        evidence=evidence,
-                        error_message=str(exc),
-                    ),
-                    True,
-                )
-            completed_at = self._clock()
+        if self._bucket is not None:
+            await self._bucket.acquire()
+        self.attempt_count += 1
+        started_at = self._clock()
+        try:
+            response = await self._transport.post(self._url, payload)
+        except TransportError as exc:
+            evidence = self._record_synthetic(
+                method,
+                params,
+                payload={"transport_error": str(exc)},
+                error=str(exc),
+            )
+            return (
+                RecordedCall(
+                    method=method,
+                    provider=self.provider,
+                    result=None,
+                    evidence=evidence,
+                    error_message=str(exc),
+                ),
+                True,
+            )
+        completed_at = self._clock()
 
         result: Any = None
         error_code: int | None = None

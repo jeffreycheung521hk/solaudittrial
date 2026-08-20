@@ -31,7 +31,7 @@ from slot_audit.replay import (
     replay_audit,
 )
 from slot_audit.report import write_reports
-from tests.epoch_support import run_audit
+from tests.epoch_support import realistic_noise, run_audit
 
 
 def _set_manifest_entry(root: Path, relative: str, data: bytes) -> None:
@@ -184,6 +184,141 @@ class ReproductionTests(ReplayTestCase):
         self.assertIn("Epoch specification", notes)
 
 
+class MessyButHonestRunTests(ReplayTestCase):
+    """A real 400,000-call run will contain transient faults.
+
+    If replay cannot survive them, every honest production run fails to
+    reproduce itself -- and in this tool's vocabulary "NOT reproduced" reads as
+    an accusation of forgery. These tests exist because the first version of
+    replay did exactly that.
+    """
+
+    async def _run_with(self, wrappers, *, directory: str, **kwargs):
+        controls = await run_all_negative_controls(
+            results_dir=self.tmp_path / f"{directory}-controls"
+        )
+        epoch = build_simulated_epoch(
+            epoch=900_400, first_slot=410_000_000, positions=512, produced=384
+        )
+        config = build_control_config(epoch).model_copy(
+            update={
+                "continuity": ContinuityConfig(
+                    hash_link_validation_population="findings_and_adjacent"
+                )
+            }
+        )
+        if "limits" in kwargs:
+            config = config.model_copy(update={"limits": kwargs.pop("limits")})
+        target = epoch.produced_slots[100]
+        run = await run_audit(
+            directory=self.tmp_path / directory,
+            epoch=epoch,
+            config=config,
+            defects={"control-a": LedgerDefects(dropped_slots=frozenset({target}))},
+            negative_controls=controls,
+            handler_wrappers=wrappers,
+            **kwargs,
+        )
+        return run, target
+
+    async def test_a_run_containing_a_transient_failure_reproduces(self) -> None:
+        from slot_audit.transport import TransportError
+
+        seen = {"n": 0}
+
+        def flaky(handler):  # type: ignore[no-untyped-def]
+            def wrapped(url: str, method: str, params: list) -> object:
+                seen["n"] += 1
+                if seen["n"] in (1, 4, 11):
+                    raise TransportError("simulated connection reset")
+                return handler(url, method, params)
+
+            return wrapped
+
+        run, target = await self._run_with({"control-a": flaky}, directory="flaky")
+        self.assertEqual(run.conclusion.result.value, "FINDINGS")
+        self.assertGreater(sum(item.retries for item in run.request_stats), 0)
+
+        result, _ = await replay_audit(
+            run.evidence_root, output_dir=self.tmp_path / "replay-flaky"
+        )
+
+        self.assertTrue(result.reproduced, result.describe())
+        self.assertTrue(
+            any(result.replayed_transport_failures.values()),
+            "the recorded failures should have been re-walked, not served as bodies",
+        )
+
+    async def test_a_run_with_seeded_noise_reproduces(self) -> None:
+        run, _target = await self._run_with(
+            {
+                "control-a": realistic_noise(seed=17),
+                "control-b": realistic_noise(seed=23),
+            },
+            directory="noisy",
+        )
+        self.assertGreater(sum(item.retries for item in run.request_stats), 0)
+
+        result, _ = await replay_audit(
+            run.evidence_root, output_dir=self.tmp_path / "replay-noisy"
+        )
+
+        self.assertTrue(result.reproduced, result.describe())
+        self.assertEqual(result.metric_differences, ())
+
+    async def test_a_run_that_exhausted_its_budget_reproduces(self) -> None:
+        """The budget record describes a call that was never sent."""
+
+        from slot_audit.config import EpochLimitsConfig
+
+        run, _target = await self._run_with(
+            {},
+            directory="starved",
+            limits=EpochLimitsConfig(max_requests_per_provider=6, max_retries=3),
+        )
+        self.assertTrue(any(item.budget_exhausted for item in run.request_stats))
+        self.assertEqual(run.conclusion.result.value, "NO_CONCLUSION")
+
+        result, _ = await replay_audit(
+            run.evidence_root, output_dir=self.tmp_path / "replay-starved"
+        )
+
+        self.assertTrue(result.reproduced, result.describe())
+
+    async def test_a_synthetic_record_is_recognised_rather_than_served(self) -> None:
+        from slot_audit.replay import SYNTHETIC_STATUS
+        from slot_audit.transport import TransportError
+
+        def always_fails(handler):  # type: ignore[no-untyped-def]
+            def wrapped(url: str, method: str, params: list) -> object:
+                if method == "getVersion":
+                    raise TransportError("down")
+                return handler(url, method, params)
+
+            return wrapped
+
+        run, _target = await self._run_with(
+            {"control-a": always_fails}, directory="synthetic"
+        )
+        exchanges = load_exchanges(run.evidence_root)
+        synthetic = [
+            item for item in exchanges if item.synthetic_kind == "transport_error"
+        ]
+
+        self.assertTrue(synthetic)
+        for item in synthetic:
+            with self.subTest(sequence=item.sequence):
+                self.assertEqual(item.http_status, SYNTHETIC_STATUS)
+                self.assertTrue(item.transport_error_message)
+
+        transport = ReplayTransport("control-a", exchanges)
+        with self.assertRaises(TransportError):
+            await transport.post(
+                "https://replay.invalid/x",
+                {"method": "getVersion", "params": [], "id": 1},
+            )
+
+
 class ForgeryTests(ReplayTestCase):
     async def test_forging_a_finding_in_demands_evidence_that_does_not_exist(
         self,
@@ -292,6 +427,35 @@ class ForgeryTests(ReplayTestCase):
         self.assertTrue(verify_manifest(run.evidence_root).ok)
         with self.assertRaisesRegex(ReplayError, "does not match its recorded digest"):
             load_exchanges(run.evidence_root)
+
+    async def test_forging_an_agreement_metric_is_caught(self) -> None:
+        """Comparing only gate status would let this through."""
+
+        run, _epoch, _target = await self._sealed_run()
+        assessment_path = run.evidence_root / "artifacts" / "assessment.json"
+        assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+        for gate in assessment["gates"]:
+            if gate["gate_id"] == "per_provider_agreement":
+                gate["metrics"]["control-a.classification_numerator"] = "512"
+        forged = (
+            json.dumps(assessment, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            + "\n"
+        ).encode("utf-8")
+        _set_manifest_entry(run.evidence_root, "artifacts/assessment.json", forged)
+        (run.evidence_root / "artifacts" / "assessment.json").write_bytes(forged)
+        self.assertTrue(verify_manifest(run.evidence_root).ok)
+
+        result, _ = await replay_audit(
+            run.evidence_root, output_dir=self.tmp_path / "replay"
+        )
+
+        self.assertFalse(result.reproduced)
+        self.assertTrue(
+            any(
+                "classification_numerator" in item for item in result.metric_differences
+            ),
+            result.describe(),
+        )
 
     async def test_a_body_that_does_not_match_its_digest_is_refused(self) -> None:
         run, _epoch, _target = await self._sealed_run()

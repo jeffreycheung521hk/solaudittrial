@@ -50,7 +50,7 @@ from .groundtruth import (
     GroundTruthHeader,
     TrustStep,
 )
-from .transport import TransportResponse
+from .transport import TransportError, TransportResponse
 from .verdict import Verdict
 
 
@@ -58,13 +58,30 @@ class ReplayError(RuntimeError):
     """The evidence cannot be replayed as recorded."""
 
 
+async def _no_delay(_seconds: float) -> None:
+    """Replay re-walks recorded retries; it must not re-wait them."""
+
+    return None
+
+
 def _canonical(params: Sequence[object]) -> str:
     return json.dumps(list(params), sort_keys=True, separators=(",", ":"), default=str)
 
 
+#: Not every retained record is a response. When a request could not be sent --
+#: the socket failed, or the budget was already spent -- the store keeps a
+#: synthetic entry so the gap is explicable rather than invisible. Replay has to
+#: recognise those: replaying a synthetic transport failure *as a response* would
+#: hand the client an HTTP 0 it treats as a hard error, and an honest run
+#: containing one transient blip would then fail to reproduce itself. Over
+#: 400,000 calls a real run will contain several, so this is the difference
+#: between replay being usable and replay accusing every honest operator.
+SYNTHETIC_STATUS = 0
+
+
 @dataclass(frozen=True, slots=True)
 class RecordedExchange:
-    """One call as the original run made it."""
+    """One call as the original run made it -- or the reason it was not made."""
 
     sequence: int
     provider: str
@@ -76,6 +93,32 @@ class RecordedExchange:
     @property
     def key(self) -> tuple[str, str, str]:
         return (self.provider, self.method, _canonical(self.params))
+
+    @property
+    def synthetic_kind(self) -> str | None:
+        """``transport_error``, ``budget_exhausted``, or ``None`` for a response."""
+
+        if self.http_status != SYNTHETIC_STATUS:
+            return None
+        try:
+            payload = json.loads(self.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "unknown"
+        if not isinstance(payload, dict):
+            return "unknown"
+        if "transport_error" in payload:
+            return "transport_error"
+        if payload.get("budget_exhausted"):
+            return "budget_exhausted"
+        return "unknown"
+
+    @property
+    def transport_error_message(self) -> str:
+        try:
+            payload = json.loads(self.body.decode("utf-8"))
+            return str(payload.get("transport_error", "transport failure"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return "transport failure"
 
 
 def load_exchanges(evidence_dir: str | Path) -> tuple[RecordedExchange, ...]:
@@ -119,11 +162,20 @@ class ReplayTransport:
     def __init__(self, provider: str, exchanges: Sequence[RecordedExchange]) -> None:
         self.provider = provider
         self._queues: dict[tuple[str, str, str], list[RecordedExchange]] = {}
+        self.skipped_budget_entries: list[int] = []
         for exchange in exchanges:
             if exchange.provider != provider:
                 continue
+            if exchange.synthetic_kind == "budget_exhausted":
+                # No request was sent, so nothing will ask for it. The replaying
+                # client hits the same budget at the same point and writes its
+                # own record; queueing this one would leave it permanently
+                # unconsumed and read as a gap in the replay.
+                self.skipped_budget_entries.append(exchange.sequence)
+                continue
             self._queues.setdefault(exchange.key, []).append(exchange)
         self.served: list[int] = []
+        self.replayed_failures: list[int] = []
         self.closed = False
 
     @property
@@ -149,6 +201,12 @@ class ReplayTransport:
             )
         exchange = queue.pop(0)
         self.served.append(exchange.sequence)
+        if exchange.synthetic_kind == "transport_error":
+            # Re-raise rather than serve. The client then follows exactly the
+            # retry path it followed originally, instead of being handed a
+            # status it would treat as a hard, non-retryable failure.
+            self.replayed_failures.append(exchange.sequence)
+            raise TransportError(exchange.transport_error_message)
         return TransportResponse(status_code=exchange.http_status, body=exchange.body)
 
     async def aclose(self) -> None:
@@ -339,6 +397,31 @@ def _resolved_from_scope(
     )
 
 
+#: Gate metrics that legitimately differ between a run and its replay, with the
+#: reason. Everything not listed here must match: comparing only gate *status*
+#: would let a forged agreement figure through so long as it stayed on the
+#: passing side of the threshold. The list is deliberately tiny and was derived
+#: by diffing an honest replay, not by guessing.
+_CONTROL_EVIDENCE_REASON = (
+    "the controls are re-run, and their request records carry fresh timestamps, "
+    "so the meta digests differ; the raw response digests do not, and the "
+    "detected verdicts are compared separately"
+)
+
+VOLATILE_GATE_METRICS: Mapping[str, Mapping[str, str]] = {
+    "manifest_provenance_completeness": {
+        "run_started_at": "the replay is a different run and starts at a different time",
+        "manifested_entries": (
+            "the replay does not re-derive the anchor from the archive, so its "
+            "store holds fewer artifacts than the original's"
+        ),
+    },
+    "negative_control_provider_hole": {"evidence_refs": _CONTROL_EVIDENCE_REASON},
+    "negative_control_token_truncation": {"evidence_refs": _CONTROL_EVIDENCE_REASON},
+    "negative_control_previous_blockhash": {"evidence_refs": _CONTROL_EVIDENCE_REASON},
+}
+
+
 @dataclass(frozen=True, slots=True)
 class ReplayResult:
     """Whether the sealed conclusion could be reproduced from the sealed bytes."""
@@ -348,8 +431,13 @@ class ReplayResult:
     original_status: str
     replayed_status: str
     gate_differences: tuple[str, ...] = ()
+    metric_differences: tuple[str, ...] = ()
     finding_differences: tuple[str, ...] = ()
+    control_differences: tuple[str, ...] = ()
     unconsumed_calls: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    replayed_transport_failures: Mapping[str, tuple[int, ...]] = field(
+        default_factory=dict
+    )
     manifest_ok: bool = True
     notes: tuple[str, ...] = ()
 
@@ -360,7 +448,9 @@ class ReplayResult:
             and self.original_result == self.replayed_result
             and self.original_status == self.replayed_status
             and not self.gate_differences
+            and not self.metric_differences
             and not self.finding_differences
+            and not self.control_differences
             and not any(self.unconsumed_calls.values())
         )
 
@@ -371,9 +461,15 @@ class ReplayResult:
             "original": {"result": self.original_result, "status": self.original_status},
             "replayed": {"result": self.replayed_result, "status": self.replayed_status},
             "gate_differences": list(self.gate_differences),
+            "metric_differences": list(self.metric_differences),
             "finding_differences": list(self.finding_differences),
+            "control_differences": list(self.control_differences),
             "unconsumed_calls": {
                 name: list(values) for name, values in self.unconsumed_calls.items()
+            },
+            "replayed_transport_failures": {
+                name: list(values)
+                for name, values in self.replayed_transport_failures.items()
             },
             "notes": list(self.notes),
         }
@@ -390,8 +486,16 @@ class ReplayResult:
                     f"{name}: {len(values)} recorded call(s) were never replayed: "
                     f"{list(values)[:10]}"
                 )
+        for name, values in sorted(self.replayed_transport_failures.items()):
+            if values:
+                lines.append(
+                    f"{name}: {len(values)} recorded transport failure(s) were "
+                    "re-walked through the same retry path"
+                )
         lines.extend(f"gate differs: {item}" for item in self.gate_differences)
+        lines.extend(f"metric differs: {item}" for item in self.metric_differences)
         lines.extend(f"finding differs: {item}" for item in self.finding_differences)
+        lines.extend(f"control differs: {item}" for item in self.control_differences)
         lines.extend(f"note: {item}" for item in self.notes)
         lines.append(
             "RESULT: the sealed conclusion was reproduced from the sealed bytes"
@@ -422,20 +526,38 @@ async def replay_audit(
         (root / "artifacts" / "result.json").read_text(encoding="utf-8")
     )
 
-    controls = []
-    for path in sorted((root / "artifacts").glob("negative-control-*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        from .audit import NegativeControlResult
-
-        controls.append(
-            NegativeControlResult(
-                control_id=payload["control_id"],
-                title=payload["title"],
-                detected=bool(payload["detected"]),
-                detail=payload["detail"],
-                observed=payload.get("observed") or {},
-            )
+    sealed_controls = {
+        json.loads(path.read_text(encoding="utf-8"))["control_id"]: json.loads(
+            path.read_text(encoding="utf-8")
         )
+        for path in sorted((root / "artifacts").glob("negative-control-*.json"))
+    }
+    # The controls are offline and deterministic, so re-running them costs
+    # nothing and buys a second question. The sealed verdicts say what the code
+    # did on the day; a fresh run says what today's code does. Comparing the two
+    # gets both answers instead of choosing between them.
+    from .negative_controls import run_all_negative_controls
+
+    controls = list(
+        await run_all_negative_controls(results_dir=Path(output_dir) / "controls")
+    )
+    control_differences: list[str] = []
+    for control in controls:
+        sealed_control = sealed_controls.get(control.control_id)
+        if sealed_control is None:
+            control_differences.append(
+                f"{control.control_id}: run now but absent from the sealed evidence"
+            )
+        elif bool(sealed_control["detected"]) != control.detected:
+            control_differences.append(
+                f"{control.control_id}: sealed detected="
+                f"{sealed_control['detected']}, re-run detected={control.detected}"
+            )
+    for control_id in sealed_controls:
+        if all(control.control_id != control_id for control in controls):
+            control_differences.append(
+                f"{control_id}: in the sealed evidence but no longer run"
+            )
 
     spec, spec_origin = reconstruct_spec(root)
     resolved = _resolved_from_scope(scope, car_path=str(root / "artifacts"))
@@ -455,9 +577,13 @@ async def replay_audit(
             transport=transport,
             evidence=evidence,
             commitment=resolved.config.scope.commitment,
-            max_concurrency=resolved.config.limits.max_concurrency,
             max_requests=resolved.config.limits.max_requests_per_provider,
             max_retries=resolved.config.limits.max_retries,
+            # A replay re-walks every retry the original made. Sleeping through
+            # the original's exponential backoff again would make replaying a
+            # long, flaky run take longer than the run did.
+            backoff_base=0.0,
+            sleep=_no_delay,
         )
 
     run = await run_epoch_audit(
@@ -486,6 +612,23 @@ async def replay_audit(
     for gate_id in original_gates:
         if all(gate.gate_id != gate_id for gate in run.assessment.gates):
             gate_differences.append(f"{gate_id}: missing from the replayed assessment")
+
+    original_metrics = {
+        item["gate_id"]: item.get("metrics") or {} for item in sealed_assessment["gates"]
+    }
+    metric_differences: list[str] = []
+    for gate in run.assessment.gates:
+        volatile = VOLATILE_GATE_METRICS.get(gate.gate_id, {})
+        sealed_metrics = original_metrics.get(gate.gate_id, {})
+        for key in sorted(set(gate.metrics) | set(sealed_metrics)):
+            if key in volatile:
+                continue
+            left = sealed_metrics.get(key)
+            right = gate.metrics.get(key)
+            if left != right:
+                metric_differences.append(
+                    f"{gate.gate_id}.{key}: sealed {left!r}, replayed {right!r}"
+                )
 
     finding_differences: list[str] = []
     sealed_findings = {
@@ -521,6 +664,8 @@ async def replay_audit(
         "Provider URLs were never retained, so endpoints are reconstructed from "
         "their recorded fingerprints.",
         f"Epoch specification: {spec_origin}.",
+        "The negative controls were re-run against today's code and compared "
+        "with the sealed verdicts, rather than being taken on trust.",
     ]
     result = ReplayResult(
         original_result=sealed["result"],
@@ -528,9 +673,15 @@ async def replay_audit(
         original_status=sealed["instrument_validation_status"],
         replayed_status=run.assessment.status.value,
         gate_differences=tuple(gate_differences),
+        metric_differences=tuple(metric_differences),
         finding_differences=tuple(finding_differences),
+        control_differences=tuple(control_differences),
         unconsumed_calls={
             name: transport.unconsumed for name, transport in transports.items()
+        },
+        replayed_transport_failures={
+            name: tuple(transport.replayed_failures)
+            for name, transport in transports.items()
         },
         manifest_ok=manifest.ok,
         notes=tuple(notes),
@@ -539,6 +690,8 @@ async def replay_audit(
 
 
 __all__ = [
+    "SYNTHETIC_STATUS",
+    "VOLATILE_GATE_METRICS",
     "RecordedExchange",
     "ReplayError",
     "ReplayResult",

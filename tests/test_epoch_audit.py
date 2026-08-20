@@ -860,6 +860,42 @@ class ConclusiveFindingRunTests(EpochAuditTestCase):
         self.assertIsNotNone(self.run.summary_evidence)
         self.assertIsNotNone(self.run.result_evidence)
 
+    async def test_the_same_conclusion_survives_a_messy_run(self) -> None:
+        """Identical inputs, plus the transient faults a real endpoint has.
+
+        A clean fixture only proves the tool works on the path its author
+        imagined. Retries, and the synthetic records they leave in evidence, must
+        not change what the run concludes.
+        """
+
+        from tests.epoch_support import realistic_noise
+
+        noisy = await run_audit(
+            directory=self.tmp_path / "noisy-conclusive",
+            epoch=self.epoch,
+            config=self.config,
+            defects={
+                "control-a": LedgerDefects(dropped_slots=frozenset({self.target}))
+            },
+            negative_controls=self.controls,
+            handler_wrappers={
+                "control-a": realistic_noise(seed=31),
+                "control-b": realistic_noise(seed=37),
+            },
+        )
+
+        self.assertGreater(sum(item.retries for item in noisy.request_stats), 0)
+        self.assertIs(noisy.assessment.status, GateStatus.PASS)
+        self.assertIs(noisy.conclusion.result, RunResult.FINDINGS)
+        self.assertEqual([item.slot for item in noisy.findings], [self.target])
+        self.assertEqual(
+            noisy.findings[0].blockhash, self.run.findings[0].blockhash
+        )
+        # The counts a reader would quote must be unchanged by the noise.
+        self.assertEqual(
+            noisy.tally.indeterminate_positions, self.run.tally.indeterminate_positions
+        )
+
     async def test_the_conclusion_is_reachable_only_because_the_gates_passed(
         self,
     ) -> None:

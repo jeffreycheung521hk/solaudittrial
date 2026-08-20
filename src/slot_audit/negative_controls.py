@@ -378,11 +378,7 @@ def build_control_config(epoch: SimulatedEpoch) -> EpochAuditConfig:
             duplicate_pubkey_policy="reject",
         ),
         continuity=ContinuityConfig(hash_link_validation_population="all_produced_blocks"),
-        limits=EpochLimitsConfig(
-            max_requests_per_provider=5_000,
-            max_concurrency=4,
-            max_retries=3,
-        ),
+        limits=EpochLimitsConfig(max_requests_per_provider=5_000, max_retries=3),
         ground_truth=GroundTruthConfig(
             source="old_faithful_car",
             car_path_env="CONTROL_CAR_PATH",
@@ -480,7 +476,6 @@ async def run_control_audit(
             transport=ScriptedTransport(ledger.handle),
             evidence=evidence,
             clock=now,
-            max_concurrency=config.limits.max_concurrency,
             max_requests=config.limits.max_requests_per_provider,
             max_retries=config.limits.max_retries,
         )

@@ -498,20 +498,22 @@ class EpochLimitsConfig(BaseModel):
     A budget cut-off manufactures indeterminate positions and a retry ceiling
     decides whether a transient error is recorded as missing data. Neither may
     be an unstated default.
+
+    There is no concurrency setting. The audit issues calls one at a time on
+    purpose -- see :class:`slot_audit.transport.AuditRpcClient` -- and a knob
+    that is required but ignored is the defect this project already had to fix
+    once with ``materiality_threshold``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_requests_per_provider: _STRICT_INT
-    max_concurrency: _STRICT_INT
     max_retries: _STRICT_INT
 
     @model_validator(mode="after")
     def validate_limits(self) -> EpochLimitsConfig:
         if self.max_requests_per_provider < 1:
             raise ValueError("max_requests_per_provider must be at least one")
-        if not 1 <= self.max_concurrency <= 64:
-            raise ValueError("max_concurrency must be between 1 and 64")
         if not 0 <= self.max_retries <= 3:
             raise ValueError("max_retries must be between 0 and 3")
         return self

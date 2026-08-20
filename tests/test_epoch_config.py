@@ -53,11 +53,7 @@ VALID: dict[str, object] = {
         "duplicate_pubkey_policy": "reject",
     },
     "continuity": {"hash_link_validation_population": "all_produced_blocks"},
-    "limits": {
-        "max_requests_per_provider": 500_000,
-        "max_concurrency": 8,
-        "max_retries": 3,
-    },
+    "limits": {"max_requests_per_provider": 500_000, "max_retries": 3},
     "ground_truth": {
         "source": "old_faithful_car",
         "car_path_env": "OLD_FAITHFUL_EPOCH_100_CAR",

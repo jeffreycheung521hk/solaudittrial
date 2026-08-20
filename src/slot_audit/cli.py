@@ -1087,7 +1087,6 @@ async def run_epoch_audit_command(
             evidence=evidence,
             commitment=model.scope.commitment,
             rps=provider.rps,
-            max_concurrency=model.limits.max_concurrency,
             max_requests=model.limits.max_requests_per_provider,
             max_retries=model.limits.max_retries,
         )

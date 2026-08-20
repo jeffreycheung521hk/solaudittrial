@@ -68,7 +68,6 @@ limits:
   # all_produced_blocks issues 402076 getBlock calls per provider, plus the
   # getBlocks batches and the token queries. Budget above that, not at it.
   max_requests_per_provider: 500000
-  max_concurrency: 8
   max_retries: 3
 
 ground_truth:

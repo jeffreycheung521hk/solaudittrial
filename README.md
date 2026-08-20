@@ -62,9 +62,25 @@ PYTHONPATH=src python3 -m slot_audit replay \
   --output-dir results/epoch-100-replay
 ```
 
-Three things are checked rather than promised: a call the original never made is
-refused, a recorded call the replay never consumed is reported, and the result,
-every gate status and every finding field must match.
+Four things are checked rather than promised: a call the original never made is
+refused, a recorded call the replay never consumed is reported, the result and
+every gate *status* must match, and so must every gate *metric* — comparing only
+statuses would let a forged agreement figure through as long as it stayed on the
+passing side of a threshold. Two metric families are exempt, listed with their
+reasons in `replay.VOLATILE_GATE_METRICS`; the list was derived by diffing an
+honest replay, not by guessing.
+
+The negative controls are re-run rather than taken from the sealed verdicts, and
+the two are compared: the sealed values say what the code did that day, a fresh
+run says what today's code does, and both answers are worth having.
+
+Not every retained record is a response. A call that could not be sent — a
+dropped socket, a spent budget — leaves a synthetic record so the gap is
+explicable. Replay recognises those and re-walks the identical retry path
+instead of serving them as bodies. A 400,000-call run will contain several
+transient faults, and an earlier version of replay reported every such honest
+run as unreproducible — which, in this tool's vocabulary, reads as an accusation
+of forgery.
 
 This is also the practical answer to the unsigned manifest. A forger who edits a
 response, its meta digest and the manifest passes `verify-evidence` — and then
@@ -250,13 +266,19 @@ PYTHONPATH=src python3 -m slot_audit verify-evidence \
 
 ### Request policy
 
-Each provider gets its own token bucket, concurrency semaphore, bounded retry
-and hard request budget, all required in `limits:`. They are configuration
-because each one changes what the run can observe: a throttled run manufactures
-false indeterminates, an unbounded retry produces coverage nobody can
-characterise, and a budget cut-off leaves gaps that are the audit's doing rather
-than the provider's — which the run records explicitly and reports in
-`## Request cost and limits`.
+Each provider gets its own token bucket, bounded retry and hard request budget,
+required in `limits:`. They are configuration because each one changes what the
+run can observe: a throttled run manufactures false indeterminates, an unbounded
+retry produces coverage nobody can characterise, and a budget cut-off leaves
+gaps that are the audit's doing rather than the provider's — which the run
+records explicitly and reports in `## Request cost and limits`.
+
+**Calls are issued one at a time, and there is no concurrency setting.** The
+audit is rate-limited rather than latency-bound, so concurrency would buy
+little, and it would cost two things the instrument argues from: the evidence
+store's write order is what shows the provider-only inference was frozen before
+the anchor was read, and replay matches recorded responses to requests in order.
+Deterministic sequencing is what makes that matching sound rather than lucky.
 
 Retries are retained individually. A call that succeeded on its fourth attempt
 is a different observation from one that succeeded immediately, and the evidence
@@ -289,6 +311,18 @@ python3.12 -m venv .venv
 cp config.example.yaml config.yaml          # Pass A
 cp .env.example .env
 ```
+
+## Fixtures are deliberately messy
+
+Three defects reached review because every fixture answered perfectly on the
+first attempt: the conclusive-`FINDINGS` path was unreachable, the constants gate
+had no failure test, and replay could not survive one transient blip. The
+fixtures were not wrong, they were *tidy*, and a tidy fixture only exercises the
+path its author already had in mind.
+
+`tests/epoch_support.realistic_noise()` injects seeded, retryable faults, and the
+end-to-end test classes each carry a noisy variant. A run under noise must reach
+the same conclusion, with the same counts, as the clean one.
 
 ## Tests
 

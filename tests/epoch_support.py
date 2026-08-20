@@ -103,7 +103,6 @@ async def run_audit(
             endpoint_fingerprint=provider.endpoint_fingerprint,
             transport=ScriptedTransport(handler),
             evidence=evidence,
-            max_concurrency=model.limits.max_concurrency,
             max_requests=model.limits.max_requests_per_provider,
             max_retries=model.limits.max_retries,
             backoff_base=0.0,
@@ -120,6 +119,46 @@ async def run_audit(
         run_negative_controls=run_negative_controls,
         chunk_size=chunk_size or epoch.spec.scheduled_slot_positions,
     )
+
+
+def realistic_noise(
+    *, seed: int, failure_rate: float = 0.08, unhealthy_rate: float = 0.05
+) -> HandlerWrapper:
+    """Inject retryable faults the way a real endpoint would, deterministically.
+
+    Three defects in a row got through review because every fixture answered
+    perfectly on the first attempt: the conclusive-FINDINGS path was untestable,
+    the constants gate had no FAIL path, and replay could not survive a single
+    transient blip. The fixtures were not wrong, they were *tidy*, and a tidy
+    fixture only exercises the path its author already had in mind.
+
+    This wrapper makes a share of calls fail in ways the transport is supposed to
+    absorb -- a dropped connection, an unhealthy node -- so that an end-to-end
+    test which passes has passed against a messy run rather than an ideal one.
+    The seed is fixed, so failures land in the same places on every machine.
+    """
+
+    import random as _random
+
+    from slot_audit.transport import ScriptedRpcError, TransportError
+
+    if not 0.0 <= failure_rate + unhealthy_rate < 1.0:
+        raise ValueError("combined failure rates must leave room for success")
+
+    def wrapper(handler: Handler) -> Handler:
+        rng = _random.Random(seed)
+
+        def wrapped(url: str, method: str, params: list[Any]) -> Any:
+            roll = rng.random()
+            if roll < failure_rate:
+                raise TransportError("simulated connection reset")
+            if roll < failure_rate + unhealthy_rate:
+                raise ScriptedRpcError(-32005, "Node is unhealthy")
+            return handler(url, method, params)
+
+        return wrapped
+
+    return wrapper
 
 
 def failing_get_blocks(slot: int) -> HandlerWrapper:
@@ -186,6 +225,7 @@ __all__ = [
     "failing_get_blocks",
     "get_block_answers",
     "inexact_context",
+    "realistic_noise",
     "run_audit",
     "with_thresholds",
 ]

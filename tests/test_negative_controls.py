@@ -337,6 +337,31 @@ class ShippedControlSuiteTests(ControlTestCase):
                 for ref in gate.evidence:
                     self.assertTrue((run.evidence_root / ref.relative_path).is_file())
 
+    async def test_the_controls_still_detect_under_transient_faults(self) -> None:
+        """Noise must not blunt the controls, nor make them fire spuriously."""
+
+        from tests.epoch_support import realistic_noise
+
+        epoch = build_simulated_epoch()
+        target = epoch.produced_slots[6]
+
+        run = await run_audit(
+            directory=self.tmp_path / "noisy",
+            epoch=epoch,
+            defects={"control-a": LedgerDefects(dropped_slots=frozenset({target}))},
+            handler_wrappers={
+                "control-a": realistic_noise(seed=41),
+                "control-b": realistic_noise(seed=43),
+            },
+        )
+
+        self.assertGreater(sum(item.retries for item in run.request_stats), 0)
+        self.assertEqual([item.slot for item in run.findings], [target])
+        self.assertIs(run.findings[0].verdict, Verdict.PROVIDER_HOLE)
+        self.assertTrue(run.findings[0].complete)
+        # Retries absorbed the faults, so nothing became indeterminate.
+        self.assertEqual(run.tally.indeterminate_positions, 0)
+
     async def test_a_run_without_controls_cannot_conclude(self) -> None:
         run = await run_audit(
             directory=self.tmp_path / "uncontrolled", run_negative_controls=False
