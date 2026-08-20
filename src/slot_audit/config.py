@@ -1,24 +1,26 @@
-"""Configuration loading with validation and secret-safe diagnostics.
+"""Configuration for the single-epoch audit.
 
-The YAML file is deliberately expanded before validation so provider URLs can use
-``${NAME}`` placeholders.  Values come from the process environment first and a
-``.env`` file beside the YAML file second.  Configuration errors never include
-expanded input values: RPC URLs commonly contain credentials.
+Errors here never include expanded input values: RPC URLs commonly carry
+credentials, so a message that echoes one turns a validation failure into a
+disclosure.
+
+This module previously also held the reconnaissance pass's configuration -- a
+second set of models with a different, looser contract. They were removed with
+that pass; what remains has one shape and one standard.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import urlsplit
 
 import yaml
 from dotenv import dotenv_values
@@ -33,177 +35,11 @@ from pydantic import (
     model_validator,
 )
 
-SLOTS_PER_DAY = 216_000
-_ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _PROVIDER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_URL_IN_TEXT = re.compile(r"(?i)\bhttps?://[^\s\"'<>]+")
 
 
 class ConfigError(ValueError):
     """Raised for readable, credential-safe configuration failures."""
-
-
-class ProviderConfig(BaseModel):
-    """One independently rate-limited Solana JSON-RPC provider."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    name: str = Field(min_length=1, max_length=100)
-    url: SecretStr
-    rps: Annotated[float, Field(gt=0, allow_inf_nan=False, strict=True)]
-    archive: Annotated[bool, Field(strict=True)] = False
-
-    @field_validator("name")
-    @classmethod
-    def validate_name(cls, value: str) -> str:
-        value = value.strip()
-        if not _PROVIDER_NAME.fullmatch(value):
-            raise ValueError(
-                "must contain only letters, numbers, '.', '_' or '-', and start "
-                "with a letter or number"
-            )
-        return value
-
-    @field_validator("url", mode="before")
-    @classmethod
-    def validate_url(cls, value: Any) -> Any:
-        if isinstance(value, SecretStr):
-            raw = value.get_secret_value()
-        elif isinstance(value, str):
-            raw = value
-        else:
-            raise ValueError("must be an HTTP(S) URL")
-        parsed = urlsplit(raw)
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("must be an absolute HTTP(S) URL")
-        return value
-
-    @property
-    def rpc_url(self) -> str:
-        """Return the URL for the RPC transport; callers must not log it."""
-
-        return self.url.get_secret_value()
-
-
-class RangeConfig(BaseModel):
-    """A fixed slot interval or a window ending at the common safe tip."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    mode: Literal["last_days", "explicit"]
-    last_days: Annotated[float, Field(gt=0, allow_inf_nan=False, strict=True)] | None = None
-    start_slot: Annotated[int, Field(ge=0, strict=True)] | None = None
-    end_slot: Annotated[int, Field(ge=0, strict=True)] | None = None
-
-    @model_validator(mode="after")
-    def validate_mode_fields(self) -> RangeConfig:
-        if self.mode == "last_days":
-            if self.last_days is None:
-                raise ValueError("last_days is required when range.mode is 'last_days'")
-            if self.start_slot is not None or self.end_slot is not None:
-                raise ValueError(
-                    "start_slot and end_slot are not allowed when range.mode is 'last_days'"
-                )
-            # Guard the conversion used by resolve_range and make the invariant explicit.
-            if math.ceil(self.last_days * SLOTS_PER_DAY) < 1:
-                raise ValueError("last_days must resolve to at least one slot")
-        else:
-            if self.start_slot is None or self.end_slot is None:
-                raise ValueError(
-                    "start_slot and end_slot are required when range.mode is 'explicit'"
-                )
-            if self.last_days is not None:
-                raise ValueError("last_days is not allowed when range.mode is 'explicit'")
-            if self.start_slot > self.end_slot:
-                raise ValueError("start_slot must be less than or equal to end_slot")
-        return self
-
-    def resolve(self, safe_tip: int) -> tuple[int, int]:
-        """Resolve this range against an already safety-adjusted common tip."""
-
-        if not isinstance(safe_tip, int) or isinstance(safe_tip, bool) or safe_tip < 0:
-            raise ConfigError("The common safe tip must be a non-negative integer")
-        if self.mode == "last_days":
-            assert self.last_days is not None  # guaranteed by model validation
-            slot_count = math.ceil(self.last_days * SLOTS_PER_DAY)
-            start = safe_tip - slot_count + 1
-            if start < 0:
-                raise ConfigError(
-                    "The requested last_days window starts before slot zero; "
-                    "choose a smaller window"
-                )
-            return start, safe_tip
-
-        assert self.start_slot is not None and self.end_slot is not None
-        end = min(self.end_slot, safe_tip)
-        if self.start_slot > end:
-            raise ConfigError(
-                "The explicit range starts above the common safe tip after applying "
-                "the tip safety margin"
-            )
-        return self.start_slot, end
-
-
-class SamplingConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    content_check_slots: Annotated[int, Field(ge=0, strict=True)] = 2_000
-    seed: Annotated[int, Field(strict=True)] = 42
-
-
-class LimitsConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    max_requests_per_provider: Annotated[int, Field(gt=0, strict=True)] = 200_000
-    tip_safety_margin_slots: Annotated[int, Field(ge=150, strict=True)] = 150
-
-
-class AuditConfig(BaseModel):
-    """Top-level audit configuration."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    providers: Annotated[list[ProviderConfig], Field(min_length=1)]
-    range: RangeConfig
-    sampling: SamplingConfig = Field(default_factory=SamplingConfig)
-    limits: LimitsConfig = Field(default_factory=LimitsConfig)
-
-    @model_validator(mode="after")
-    def provider_names_are_unique(self) -> AuditConfig:
-        seen: set[str] = set()
-        duplicates: set[str] = set()
-        for provider in self.providers:
-            folded = provider.name.casefold()
-            if folded in seen:
-                duplicates.add(provider.name)
-            seen.add(folded)
-        if duplicates:
-            names = ", ".join(sorted(duplicates, key=str.casefold))
-            raise ValueError(f"provider names must be unique (duplicates: {names})")
-        return self
-
-    def public_fingerprint(self) -> str:
-        """Fingerprint resumable settings without storing raw URLs or keys."""
-
-        normalized = {
-            "schema": 1,
-            "providers": [
-                {
-                    "name": p.name,
-                    "rps": p.rps,
-                    "archive": p.archive,
-                    # This value exists only in memory while computing the final
-                    # digest.  It is never returned or written to the checkpoint.
-                    "url": p.rpc_url,
-                }
-                for p in self.providers
-            ],
-            "range": self.range.model_dump(mode="json"),
-            "sampling": self.sampling.model_dump(mode="json"),
-            "limits": self.limits.model_dump(mode="json"),
-        }
-        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
-        return hashlib.sha256(encoded).hexdigest()
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -215,132 +51,6 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         error_type = type(exc).__name__
         raise ConfigError(f"Could not read environment file {path.name}: {error_type}") from None
     return {key: value for key, value in values.items() if value is not None}
-
-
-def expand_environment(
-    text: str,
-    *,
-    environment: Mapping[str, str] | None = None,
-) -> str:
-    """Expand ``${NAME}`` references, reporting all missing names at once."""
-
-    source = os.environ if environment is None else environment
-    missing = sorted({name for name in _ENV_REFERENCE.findall(text) if name not in source})
-    if missing:
-        raise ConfigError(
-            "Missing environment variable(s) referenced by config: " + ", ".join(missing)
-        )
-    return _ENV_REFERENCE.sub(lambda match: source[match.group(1)], text)
-
-
-def load_config(
-    path: str | Path,
-    *,
-    environment: Mapping[str, str] | None = None,
-    dotenv_path: str | Path | None = None,
-) -> AuditConfig:
-    """Load YAML using environment-over-``.env`` precedence.
-
-    ``environment`` is injectable to keep tests deterministic.  Passing it does
-    not mutate ``os.environ`` and still falls back to the selected ``.env`` file.
-    """
-
-    config_path = Path(path)
-    try:
-        raw_text = config_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ConfigError(
-            f"Could not read config file {config_path}: {exc.strerror or type(exc).__name__}"
-        ) from None
-
-    env_file = Path(dotenv_path) if dotenv_path is not None else config_path.parent / ".env"
-    merged: dict[str, str] = _read_dotenv(env_file)
-    merged.update(dict(os.environ if environment is None else environment))
-    expanded = expand_environment(raw_text, environment=merged)
-
-    try:
-        payload = yaml.safe_load(expanded)
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        # Do not stringify the YAML exception: it can contain the expanded URL.
-        raise ConfigError(f"Invalid YAML in {config_path.name}{location}") from None
-    if not isinstance(payload, dict):
-        raise ConfigError(f"Config {config_path.name} must contain a YAML mapping")
-
-    try:
-        return AuditConfig.model_validate(payload)
-    except ValidationError as exc:
-        # Pydantic's normal exception includes input_value, which may be a URL/key.
-        details: list[str] = []
-        for error in exc.errors(include_url=False, include_input=False):
-            location = ".".join(str(part) for part in error["loc"]) or "config"
-            details.append(f"{location}: {error['msg']}")
-        raise ConfigError("Invalid configuration: " + "; ".join(details)) from None
-
-
-def redact_text(value: object, *, secrets: tuple[str, ...] = ()) -> str:
-    """Return an output-safe error string.
-
-    Whole configured URLs and explicitly supplied values are removed first, then
-    any other HTTP(S) URL is removed so transport diagnostics cannot disclose a
-    credential-bearing endpoint.
-    """
-
-    text = str(value)
-    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
-        text = text.replace(secret, "<redacted>")
-    return _URL_IN_TEXT.sub("<redacted-url>", text)
-
-
-def url_redaction_values(urls: Iterable[str]) -> tuple[str, ...]:
-    """Derive credential-like fragments that transport errors may echo alone."""
-
-    values: set[str] = set()
-    for url in urls:
-        if not url:
-            continue
-        values.add(url)
-        parsed = urlsplit(url)
-        for credential in (parsed.username, parsed.password):
-            if credential:
-                values.add(unquote(credential))
-        sensitive_query_names = {
-            "api-key",
-            "api_key",
-            "apikey",
-            "auth",
-            "key",
-            "secret",
-            "token",
-        }
-        for query_name, query_value in parse_qsl(parsed.query, keep_blank_values=False):
-            if query_name.casefold() in sensitive_query_names or len(query_value) >= 4:
-                values.add(query_value)
-        for segment in parsed.path.split("/"):
-            decoded = unquote(segment)
-            if len(decoded) >= 8:
-                values.add(decoded)
-        hostname = parsed.hostname or ""
-        for label in hostname.split("."):
-            if len(label) >= 12 and label not in {"mainnet-beta"}:
-                values.add(label)
-    return tuple(sorted(values, key=lambda item: (-len(item), item)))
-
-
-__all__ = [
-    "AuditConfig",
-    "ConfigError",
-    "LimitsConfig",
-    "ProviderConfig",
-    "RangeConfig",
-    "SLOTS_PER_DAY",
-    "SamplingConfig",
-    "expand_environment",
-    "load_config",
-    "redact_text",
-    "url_redaction_values",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +559,7 @@ def read_environment(
 
 
 __all__ = [
-    *__all__,
+    "ConfigError",
     "ContinuityConfig",
     "EpochAuditConfig",
     "EpochLimitsConfig",

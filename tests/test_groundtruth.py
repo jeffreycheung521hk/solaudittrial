@@ -115,6 +115,25 @@ class PublishedEpoch100Tests(unittest.TestCase):
         self.assertIs(spec.provenance, UNVERIFIED_PROVENANCE)
         self.assertFalse(spec.provenance.verified_against_archive)
 
+    def test_the_epoch_100_slot_arithmetic_is_right(self) -> None:
+        """Epoch 100 really is slots 43,200,000-43,631,999 on a 432,000 schedule.
+
+        Carried over from the epoch-schedule tests when the reconnaissance pass
+        was removed. Nothing in the audit computes epoch boundaries any more --
+        they are pinned constants -- but the constants still have to be the
+        boundaries Solana's schedule actually produces.
+        """
+
+        slots_per_epoch = 432_000
+        spec = EPOCH_100_GROUND_TRUTH
+
+        self.assertEqual(spec.first_slot, spec.epoch * slots_per_epoch)
+        self.assertEqual(spec.last_slot, (spec.epoch + 1) * slots_per_epoch - 1)
+        self.assertEqual(spec.first_slot // slots_per_epoch, 100)
+        self.assertEqual(spec.last_slot // slots_per_epoch, 100)
+        self.assertEqual(spec.predecessor_boundary_slot // slots_per_epoch, 99)
+        self.assertEqual((spec.last_slot + 1) // slots_per_epoch, 101)
+
     def test_the_declared_figures_are_internally_consistent(self) -> None:
         spec = EPOCH_100_GROUND_TRUTH
 
