@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "blockhash": "child-hash",
+    "previousBlockhash": "parent-hash",
+    "parentSlot": 102,
+    "blockHeight": 99
+  },
+  "id": 1
+}

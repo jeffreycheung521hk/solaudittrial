@@ -1,0 +1,94 @@
+# Fail-closed single-epoch audit: one complete Solana epoch, exactly two
+# genuinely distinct RPC providers, exactly one legacy SPL Token mint.
+#
+# There are no defaults. Every scoping and judgment value below is required, and
+# an unknown key is a hard error rather than a silently ignored typo.
+#
+# The ground-truth values are pinned in src/slot_audit/groundtruth.py. Restating
+# them here is mandatory (an unstated assumption is not auditable) but it is not
+# authoritative: a value that disagrees with the pinned constant fails the run
+# rather than redefining it.
+
+schema_version: 1
+
+population:
+  definition: >-
+    Every scheduled slot position of Solana mainnet-beta epoch 100
+    (slots 43200000-43631999 inclusive), together with every token account of
+    one legacy SPL Token mint as of the pinned slot.
+  unit: scheduled slot position
+  description: >-
+    Complete population, not a sample. 432000 scheduled positions are examined;
+    no position is excluded from the denominator except as recorded by the
+    declared denominator policy.
+
+scope:
+  epoch: 100
+  first_slot: 43200000
+  last_slot: 43631999
+  scheduled_slot_positions: 432000
+  commitment: finalized
+  # Account state is measured at exactly this slot. Standard mainnet RPC serves
+  # getProgramAccounts against its *current* bank, so satisfying the policy
+  # below requires a provider with genuine as-of-slot support. If neither
+  # provider can pin the context, the gate fails and the run concludes nothing.
+  pinned_slot: 43631999
+  exact_context_policy: require_exact_pinned_slot
+
+thresholds:
+  # Quoted so the threshold is an exact decimal. An unquoted YAML 0.01 is a
+  # binary float and is rejected.
+  indeterminate_threshold: "0.01"
+  denominator_policy: determinate_positions_only
+  materiality_threshold: "0.0001"
+  minimum_provider_agreement: "0.99"
+
+token:
+  # Wrapped SOL: an original-SPL-Token (non-2022) mint that predates epoch 100.
+  mint: So11111111111111111111111111111111111111112
+  program_id: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+  account_size: 165
+  mint_offset: 0
+  amount_offset: 64
+  state_offset: 108
+  supply_offset: 36
+  included_account_states:
+    - initialized
+    - frozen
+  zero_balance_policy: include
+  duplicate_pubkey_policy: reject
+
+continuity:
+  # all_produced_blocks is the defensible choice: it fetches and validates every
+  # produced block's previousBlockhash from both providers. findings_and_adjacent
+  # is far cheaper and correspondingly weaker.
+  hash_link_validation_population: all_produced_blocks
+
+limits:
+  # all_produced_blocks issues 402076 getBlock calls per provider, plus the
+  # getBlocks batches and the token queries. Budget above that, not at it.
+  max_requests_per_provider: 500000
+  max_concurrency: 8
+  max_retries: 3
+
+ground_truth:
+  source: old_faithful_car
+  car_path_env: OLD_FAITHFUL_EPOCH_100_CAR
+  car_sha256: 9f6d631833a8dfe0a4253ceede8e4af18a63603f0131a71ca5e947ba77eaec5a
+  car_root_cid: bafyreibqt2nvroysxlxctgb52xxn27ectsllv2xyka4qar7ga6vupmbs3i
+  source_commit: a69a0d2e189006608e3b73b7659a957b00b3567e
+  slots_file_name: 100.slots.txt
+  predecessor_boundary_slot: 43199999
+  produced_blocks: 402076
+  skipped_slots: 29924
+  extractor: car_block_header
+  # Optional. If set, it must not resolve to either audited provider.
+  endpoint_env: null
+
+providers:
+  - name: provider-a
+    url_env: PROVIDER_A_URL
+    rps: 10
+  - name: provider-b
+    url_env: PROVIDER_B_URL
+    rps: 10

@@ -1,0 +1,99 @@
+name: CI
+
+# The whole suite is offline and deterministic: the negative controls generate
+# their own fixture archive, so nothing here needs network access, credentials,
+# or the 62.9 GB Old Faithful CAR.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev]'
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Compile
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: python -m compileall -q src tests
+
+      - name: Test
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
+
+      - name: CLI entry point
+        env:
+          PYTHONPATH: src
+        run: python -m slot_audit --help
+
+  self-check:
+    name: Instrument self-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e '.'
+
+      # A green test suite is not the same claim as a working instrument. This
+      # job runs the shipped negative controls through the production audit path
+      # and fails if any of the three stops detecting its injected defect.
+      - name: Run the shipped negative controls
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<'PY'
+          import asyncio, sys
+          from pathlib import Path
+          from slot_audit.negative_controls import run_all_negative_controls
+
+          async def main() -> int:
+              results = await run_all_negative_controls(results_dir=Path("ci-controls"))
+              failed = [item for item in results if not item.detected]
+              for item in results:
+                  print(f"{'PASS' if item.detected else 'FAIL'}  {item.control_id}: {item.detail}")
+              return 1 if failed else 0
+
+          sys.exit(asyncio.run(main()))
+          PY
+
+      - name: Verify a control run's evidence manifest
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m slot_audit verify-evidence \
+            --evidence-dir ci-controls/removed_known_block/evidence
