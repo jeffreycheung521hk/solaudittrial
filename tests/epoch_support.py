@@ -65,6 +65,8 @@ async def run_audit(
     write_car: bool = True,
     run_negative_controls: bool = False,
     negative_controls: object = None,
+    provider_urls: tuple[str, str] | None = None,
+    resolved_sink: list | None = None,
 ) -> AuditRun:
     """Run the production audit over a fixture epoch with injectable defects."""
 
@@ -73,7 +75,13 @@ async def run_audit(
         directory, epoch, car_bytes=car_bytes, write_car=write_car
     )
     model = config or build_control_config(epoch)
-    resolved = resolve_control_config(model, car_path=car_path)
+    resolved = (
+        resolve_control_config(model, car_path=car_path, urls=provider_urls)
+        if provider_urls is not None
+        else resolve_control_config(model, car_path=car_path)
+    )
+    if resolved_sink is not None:
+        resolved_sink.append(resolved)
     scope = control_token_scope()
     wrappers = dict(handler_wrappers or {})
     ledgers = {

@@ -719,7 +719,8 @@ class AbsenceConfirmationTests(EpochAuditTestCase):
             for item in run.indeterminate
             if item.slot == target and item.subject.startswith("provider_hole:")
         )
-        self.assertIn("retention limitation", matter.reason)
+        self.assertIn("BLOCK_CLEANED_UP", matter.reason)
+        self.assertIn("storage-window limitation", matter.reason)
         self.assertIn("not a demonstrated data hole", matter.reason)
 
     async def test_a_contradicting_direct_answer_is_not_a_hole(self) -> None:

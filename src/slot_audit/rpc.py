@@ -21,11 +21,14 @@ from typing import Any, Protocol, TypeAlias
 import httpx
 
 from .config import ProviderConfig
+from .solana_codes import RETRYABLE_CODES
 
 FINALIZED = "finalized"
 MAX_GET_BLOCKS_RANGE = 500_000
 MAX_RETRIES = 3
-RETRYABLE_RPC_CODES = frozenset({-32004, -32005})
+#: Single source of truth: see :mod:`slot_audit.solana_codes` for what each code
+#: means and why it is or is not worth another attempt.
+RETRYABLE_RPC_CODES = RETRYABLE_CODES
 
 _FIRST_AVAILABLE_BLOCK_RE = re.compile(
     r"first\s+available\s+block\s*:\s*([0-9][0-9_,]*)", re.IGNORECASE

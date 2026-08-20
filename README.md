@@ -47,6 +47,32 @@ It writes `results/epoch-100/evidence/` (raw bytes, sanitized request metadata,
 derived artifacts, provenance and a manifest), plus `summary.md` and
 `result.json` beside it.
 
+### Re-performance is a command, not an adjective
+
+Every call's exact bytes are retained, and `replay` is the path that consumes
+them. It does not reimplement anything — reimplementing would only prove the
+copy agrees with itself. It runs the same `run_epoch_audit`, with a transport
+that serves recorded responses instead of a socket and an anchor rebuilt from
+the retained derived records, then compares the recomputed conclusion against
+the sealed one:
+
+```bash
+PYTHONPATH=src python3 -m slot_audit replay \
+  --evidence-dir results/epoch-100/evidence \
+  --output-dir results/epoch-100-replay
+```
+
+Three things are checked rather than promised: a call the original never made is
+refused, a recorded call the replay never consumed is reported, and the result,
+every gate status and every finding field must match.
+
+This is also the practical answer to the unsigned manifest. A forger who edits a
+response, its meta digest and the manifest passes `verify-evidence` — and then
+has to make the forged bytes reproduce the sealed conclusion. Forging a finding
+*in* fails immediately, because replay asks for the confirming `getBlock` the
+original never made. Forging one *out* fails too, because the confirming calls
+the original did make are left unconsumed. Both are tested.
+
 ### A zero-finding result is only meaningful if the instrument passed
 
 The run produces exactly one authoritative
@@ -68,6 +94,14 @@ renders it; neither recomputes a gate. Any failed mandatory gate forces
 | `distinct_endpoints` | The two providers, and the anchor, are independent sources |
 | `finding_evidence_completeness` | Every conclusive finding carries what a reviewer needs to re-perform it |
 | `manifest_provenance_completeness` | Evidence is complete, unmodified and fully attributed |
+
+Gates are declared in `assessment.GATE_REGISTRY`, which is the only source of
+`MANDATORY_GATES`; a gate cannot be constructed outside it, nor against its
+registered status. `tests/test_gate_coverage.py` then requires that **every
+mandatory gate has a scenario that executes and observes it failing**, and
+records whether that scenario drives the full orchestration or re-assesses a
+crafted input. Adding a mandatory gate without a failure test breaks the build —
+which is the specific gap that shipped once and had to be caught by review.
 
 `hash_link_continuity`, `token_supply_reconciliation` and `materiality_assessment`
 are reported but are **not** mandatory: their failure is a *finding about the

@@ -1017,6 +1017,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="emit the census as JSON"
     )
 
+    replay_parser = subparsers.add_parser(
+        "replay",
+        help=(
+            "re-perform a sealed run from its own evidence, without touching the "
+            "network, and check that the conclusion reproduces"
+        ),
+    )
+    replay_parser.add_argument(
+        "--evidence-dir", required=True, help="the evidence directory to replay"
+    )
+    replay_parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="where to write the replay's own evidence and reports",
+    )
+    replay_parser.add_argument(
+        "--json", action="store_true", help="emit the comparison as JSON"
+    )
+
     verify_parser = subparsers.add_parser(
         "verify-evidence",
         help="closed-world verification of an evidence manifest",
@@ -1088,6 +1107,23 @@ async def run_epoch_audit_command(
     return EXIT_COMPLETE if run.conclusion.result.value != "NO_CONCLUSION" else EXIT_PARTIAL
 
 
+async def replay_command(
+    evidence_dir: str, output_dir: str, *, as_json: bool
+) -> int:
+    """Re-perform a run from its evidence and report whether it reproduced."""
+
+    from .replay import replay_audit
+    from .report import write_reports
+
+    result, run = await replay_audit(evidence_dir, output_dir=output_dir)
+    write_reports(run, results_dir=output_dir)
+    if as_json:
+        print(json.dumps(result.to_payload(), indent=2, sort_keys=True))
+    else:
+        print(result.describe())
+    return EXIT_COMPLETE if result.reproduced else EXIT_FAILED
+
+
 def probe_car_command(car: str, *, max_blocks: int | None, as_json: bool) -> int:
     """Report what an archive contains, so a schema assumption can be checked."""
 
@@ -1126,6 +1162,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return verify_evidence_command(args.evidence_dir, args.results_dir)
         except EvidenceError as exc:
+            print(f"error: {exc}")
+            return EXIT_FAILED
+    if args.command == "replay":
+        from .evidence import EvidenceError
+        from .replay import ReplayError
+
+        try:
+            operation = partial(
+                replay_command,
+                args.evidence_dir,
+                args.output_dir,
+                as_json=args.json,
+            )
+            return anyio.run(operation, backend="asyncio")
+        except (ReplayError, EvidenceError, ConfigError, ValueError) as exc:
             print(f"error: {exc}")
             return EXIT_FAILED
     if args.command == "probe-car":
@@ -1180,6 +1231,7 @@ __all__ = [
     "main",
     "run_enumeration",
     "probe_car_command",
+    "replay_command",
     "run_epoch_audit_command",
     "verify_evidence_command",
 ]

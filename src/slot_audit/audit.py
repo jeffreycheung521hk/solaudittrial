@@ -53,6 +53,7 @@ from .groundtruth import (
     derive_ground_truth,
     pinned_spec,
 )
+from .solana_codes import DENIAL_CODES, denies_block, describe, is_retention_limit
 from .token import (
     DuplicatePubkeyPolicy,
     TokenError,
@@ -331,6 +332,58 @@ class SlotOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class PositionOutcome:
+    """What one provider's answer at one position means, as a value.
+
+    Pulling this out of the counting loop is not tidying. The previous version
+    computed "classification agreement" and "availability agreement" inside a
+    432,000-iteration accumulator, where nobody could see that the two were the
+    same predicate written twice -- and nobody did, for two review rounds. A nine
+    -cell function has an input domain small enough to tabulate exhaustively, so
+    a duplicated definition shows up as two identical columns in a test.
+    """
+
+    verdict: Verdict
+    #: True when the provider's unaided inference matched the anchor, False when
+    #: it did not, and None when the position is not scoreable at all.
+    agrees_with_anchor: bool | None
+    #: The provider answered for this position, whatever the anchor says.
+    covered: bool
+
+    @property
+    def determinate(self) -> bool:
+        return self.verdict is not Verdict.INDETERMINATE
+
+
+def classify_position(
+    state: ProviderSlotState, truth: GroundTruthState
+) -> PositionOutcome:
+    """Classify one (provider answer, ground truth) pair. Total over all nine."""
+
+    covered = state is not ProviderSlotState.UNCOVERED
+    if not covered or truth is GroundTruthState.UNKNOWN:
+        # Either we did not ask, or we cannot check. Both are unscoreable, and
+        # collapsing them into "disagreement" would let coverage gaps read as
+        # provider error.
+        return PositionOutcome(Verdict.INDETERMINATE, None, covered)
+
+    present = state is ProviderSlotState.PRESENT
+    produced = truth is GroundTruthState.PRODUCED
+    if present and produced:
+        verdict = Verdict.PRESENT
+    elif present:
+        verdict = Verdict.GROUND_TRUTH_CONFLICT
+    elif produced:
+        verdict = Verdict.PROVIDER_HOLE
+    else:
+        verdict = Verdict.PROTOCOL_SKIPPED
+
+    # A provider on its own can only say "present" or "missing, so presumably
+    # skipped". It agrees exactly when that unaided reading matches the anchor.
+    return PositionOutcome(verdict, present == produced, covered)
+
+
+@dataclass(frozen=True, slots=True)
 class ClassificationTally:
     """Counters over all scheduled positions, plus the positions worth naming."""
 
@@ -427,43 +480,18 @@ def classify_epoch(
         verdicts: dict[str, Verdict] = {}
         position_indeterminate = False
         for name, state in states.items():
-            if state is ProviderSlotState.UNCOVERED or truth is GroundTruthState.UNKNOWN:
-                verdict = Verdict.INDETERMINATE
-            elif state is ProviderSlotState.PRESENT:
-                verdict = (
-                    Verdict.PRESENT
-                    if truth is GroundTruthState.PRODUCED
-                    else Verdict.GROUND_TRUTH_CONFLICT
-                )
-            elif truth is GroundTruthState.PRODUCED:
-                verdict = Verdict.PROVIDER_HOLE
-            else:
-                verdict = Verdict.PROTOCOL_SKIPPED
+            # The judgment is a pure function; this loop only folds over it.
+            outcome = classify_position(state, truth)
+            verdict = outcome.verdict
             verdicts[name] = verdict
             verdict_counts[name][verdict.value] += 1
-            if verdict is Verdict.INDETERMINATE:
+            if not outcome.determinate:
                 position_indeterminate = True
-
-            # Coverage is about this provider alone: did it successfully answer
-            # for this position at all? It has no dependence on the anchor, which
-            # is what makes it a different measurement from agreement rather than
-            # the same one relabelled.
-            if state is not ProviderSlotState.UNCOVERED:
+            if outcome.covered:
                 covered_positions[name] += 1
-
-            # A provider on its own can only infer "present" or "missing, so
-            # presumably skipped".  Classification agreement measures how often
-            # that unaided inference matches the anchored label. This is the only
-            # agreement figure; see ProviderAgreement for why there is not a
-            # second one.
-            if verdict is not Verdict.INDETERMINATE:
+            if outcome.agrees_with_anchor is not None:
                 classification_total[name] += 1
-                naive = (
-                    Verdict.PRESENT
-                    if state is ProviderSlotState.PRESENT
-                    else Verdict.PROTOCOL_SKIPPED
-                )
-                if naive is verdict:
+                if outcome.agrees_with_anchor:
                     classification_hits[name] += 1
             elif count_all:
                 classification_total[name] += 1
@@ -523,14 +551,9 @@ REQUIRED_FINDING_EVIDENCE = (
     "ground_truth_header",
 )
 
-#: Codes in which the provider is actually *answering* that it has no block at
-#: this slot. Solana returns -32007/-32009 for a slot that was skipped or is
-#: missing after a ledger jump; a null result says the same thing.
-SLOT_ABSENT_RPC_CODES = frozenset({-32007, -32009})
-
-#: The provider pruned the block. That is a retention limitation, and a
-#: retention limitation is not the same claim as a data hole.
-BELOW_RETENTION_RPC_CODE = -32001
+#: Re-exported from :mod:`slot_audit.solana_codes`, which carries the reasoning
+#: for every code and the exhaustive test over it.
+SLOT_ABSENT_RPC_CODES = DENIAL_CODES
 
 
 #: A bare ``null`` is a *successful* response, so the transport never retries it.
@@ -560,18 +583,18 @@ def confirms_absence(call: RecordedCall) -> tuple[bool, str, str | None]:
 
     if not call.failed and call.result is None:
         return True, "the provider returned a null block for this slot", "null"
-    if call.error_code in SLOT_ABSENT_RPC_CODES:
+    if denies_block(call.error_code):
         return (
             True,
-            f"the provider answered {call.error_code} "
-            f"({call.error_message}) for this slot",
+            f"the provider answered {describe(call.error_code)} for this slot "
+            f"({call.error_message})",
             "explicit_denial",
         )
-    if call.error_code == BELOW_RETENTION_RPC_CODE:
+    if is_retention_limit(call.error_code):
         return (
             False,
-            "the provider reports the slot is below its retention boundary "
-            f"({call.error_message}); that is a retention limitation, not a "
+            f"the provider answered {describe(call.error_code)} "
+            f"({call.error_message}); that is a storage-window limitation, not a "
             "demonstrated data hole",
             None,
         )
@@ -916,6 +939,7 @@ async def run_epoch_audit(
     spec: EpochGroundTruthSpec | None = None,
     extractor: GroundTruthExtractor | None = None,
     negative_controls: Sequence[NegativeControlResult] | None = None,
+    ground_truth_loader: Callable[[EvidenceStore], GroundTruth] | None = None,
     run_negative_controls: bool = True,
     chunk_size: int = DEFAULT_GETBLOCKS_CHUNK,
     now: Callable[[], str] = utc_now,
@@ -990,12 +1014,18 @@ async def run_epoch_audit(
             evidence=evidence,
         )
 
-        ground_truth = derive_ground_truth(
-            resolved.car_path,
-            spec=chosen_spec,
-            extractor=chosen_extractor,
-            evidence=evidence,
-        )
+        # Deriving from the archive is the default, not the only way. Replay
+        # supplies a loader that rebuilds the anchor from the retained derived
+        # records, which is what lets a run be re-performed without the archive.
+        if ground_truth_loader is not None:
+            ground_truth = ground_truth_loader(evidence)
+        else:
+            ground_truth = derive_ground_truth(
+                resolved.car_path,
+                spec=chosen_spec,
+                extractor=chosen_extractor,
+                evidence=evidence,
+            )
         if not ground_truth.verified:
             for step in ground_truth.failures:
                 indeterminate.append(
@@ -1907,13 +1937,13 @@ def build_assessment(
 
 __all__ = [
     "DEFAULT_GETBLOCKS_CHUNK",
-    "BELOW_RETENTION_RPC_CODE",
     "REQUIRED_FINDING_EVIDENCE",
     "SLOT_ABSENT_RPC_CODES",
     "AuditError",
     "AuditRun",
     "BlockFinding",
     "ClassificationTally",
+    "PositionOutcome",
     "IndeterminateMatter",
     "NegativeControlResult",
     "ProviderCollection",
@@ -1923,6 +1953,7 @@ __all__ = [
     "build_assessment",
     "build_findings",
     "classify_epoch",
+    "classify_position",
     "collect_provider",
     "confirms_absence",
     "freeze_provider_inference",

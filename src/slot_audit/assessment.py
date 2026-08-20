@@ -35,20 +35,127 @@ class RunResult(StrEnum):
     NO_CONCLUSION = "NO_CONCLUSION"
 
 
-#: Every gate below must pass before the run is allowed to conclude anything.
-MANDATORY_GATES: tuple[str, ...] = (
-    "negative_control_provider_hole",
-    "negative_control_token_truncation",
-    "negative_control_previous_blockhash",
-    "ground_truth_constants_provenance",
-    "ground_truth_provenance_binding",
-    "ground_truth_full_epoch_coverage",
-    "per_provider_agreement",
-    "indeterminate_threshold",
-    "exact_pinned_slot_support",
-    "distinct_endpoints",
-    "finding_evidence_completeness",
-    "manifest_provenance_completeness",
+@dataclass(frozen=True, slots=True)
+class GateSpec:
+    """A gate's declared identity, independent of the code that evaluates it.
+
+    Gate identity used to be implicit: the names lived in one module and the
+    fourteen evaluations lived inside a 450-line builder in another, with only a
+    runtime check tying them together. Nothing had a handle you could point a
+    test at, which is why the most consequential gate in the tool shipped
+    without a FAIL-path test and nobody noticed for a review round.
+
+    Declaring gates here gives each one an addressable identity, makes this
+    module the single source of truth for what is mandatory, and lets the test
+    suite assert -- mechanically -- that every mandatory gate has a test which
+    actually observes it failing.
+    """
+
+    gate_id: str
+    title: str
+    mandatory: bool
+    rationale: str
+
+
+GATE_REGISTRY: tuple[GateSpec, ...] = (
+    GateSpec(
+        "negative_control_provider_hole",
+        "Removing a block known to exist yields PROVIDER_HOLE",
+        True,
+        "an instrument that cannot detect a planted hole cannot report a real one",
+    ),
+    GateSpec(
+        "negative_control_token_truncation",
+        "A truncated enumeration under-reports supply by exactly the dropped balance",
+        True,
+        "the reconciliation must be sensitive to the defect it exists to find",
+    ),
+    GateSpec(
+        "negative_control_previous_blockhash",
+        "A corrupted previousBlockhash surfaces as PREVIOUS_BLOCKHASH_MISMATCH",
+        True,
+        "a chain check that cannot see a break is not a chain check",
+    ),
+    GateSpec(
+        "ground_truth_constants_provenance",
+        "The pinned constants trace to an authority",
+        True,
+        "an anchor whose root is unsourced verifies a file against a typed number",
+    ),
+    GateSpec(
+        "ground_truth_provenance_binding",
+        "The archive is the pinned one, structurally and by digest",
+        True,
+        "the classification is only as good as the archive it was made against",
+    ),
+    GateSpec(
+        "ground_truth_full_epoch_coverage",
+        "Ground truth covers every scheduled position of the epoch",
+        True,
+        "a partial anchor silently converts unknowns into skips",
+    ),
+    GateSpec(
+        "per_provider_agreement",
+        "Each provider separately meets the configured minimum agreement",
+        True,
+        "a provider that disagrees wholesale is not being measured, it is broken",
+    ),
+    GateSpec(
+        "indeterminate_threshold",
+        "Indeterminate positions stay within the configured threshold",
+        True,
+        "a run that could not determine most of the epoch has not audited it",
+    ),
+    GateSpec(
+        "exact_pinned_slot_support",
+        "Both providers served the exact pinned slot",
+        True,
+        "account state measured at an unknown slot is not a measurement",
+    ),
+    GateSpec(
+        "distinct_endpoints",
+        "The two providers, and the anchor, are genuinely distinct sources",
+        True,
+        "one upstream answering twice is not corroboration",
+    ),
+    GateSpec(
+        "finding_evidence_completeness",
+        "Every conclusive finding carries the evidence needed to re-perform it",
+        True,
+        "a finding nobody else can check is an assertion, not a finding",
+    ),
+    GateSpec(
+        "manifest_provenance_completeness",
+        "Evidence is complete, unmodified and fully attributed",
+        True,
+        "an incomplete record cannot support any conclusion drawn from it",
+    ),
+    GateSpec(
+        "hash_link_continuity",
+        "Validated hash links are consistent with the anchor",
+        False,
+        "a broken link is a finding about the providers, not a malfunction here",
+    ),
+    GateSpec(
+        "token_supply_reconciliation",
+        "Enumerated token accounts reconcile with the mint supply",
+        False,
+        "a discrepancy is the result, and must not suppress its own reporting",
+    ),
+    GateSpec(
+        "materiality_assessment",
+        "Observed discrepancies weighed against the configured materiality",
+        False,
+        "materiality qualifies a result; it does not decide instrument health",
+    ),
+)
+
+GATE_SPECS: Mapping[str, GateSpec] = {spec.gate_id: spec for spec in GATE_REGISTRY}
+
+#: Derived, not restated. Adding a mandatory gate to the registry is the only
+#: way to add one, so the two can never drift apart.
+MANDATORY_GATES: tuple[str, ...] = tuple(
+    spec.gate_id for spec in GATE_REGISTRY if spec.mandatory
 )
 
 
@@ -313,23 +420,46 @@ def build_gate(
     *,
     passed: bool,
     detail: str,
-    mandatory: bool = True,
+    mandatory: bool | None = None,
     evidence: Sequence[EvidenceRef] = (),
     metrics: Mapping[str, str] | None = None,
 ) -> Gate:
+    """Construct a gate, taking its mandatory status from the registry.
+
+    ``mandatory`` may be passed only to restate what the registry already says.
+    Disagreeing with it raises: a caller must not be able to downgrade a gate at
+    the point of construction, which is the one place such a change would look
+    like an ordinary keyword argument.
+    """
+
+    spec = GATE_SPECS.get(gate_id)
+    if spec is None:
+        raise ValueError(
+            f"gate {gate_id!r} is not in GATE_REGISTRY; declare it there so it "
+            "gains an identity the test suite can require coverage for"
+        )
+    if mandatory is not None and mandatory != spec.mandatory:
+        raise ValueError(
+            f"gate {gate_id!r} is registered as "
+            f"{'mandatory' if spec.mandatory else 'advisory'} and cannot be "
+            "constructed as the opposite"
+        )
     return Gate(
         gate_id=gate_id,
         title=title,
         status=GateStatus.PASS if passed else GateStatus.FAIL,
         detail=detail,
-        mandatory=mandatory,
+        mandatory=spec.mandatory,
         evidence=tuple(evidence),
         metrics=dict(metrics or {}),
     )
 
 
 __all__ = [
+    "GATE_REGISTRY",
+    "GATE_SPECS",
     "MANDATORY_GATES",
+    "GateSpec",
     "CombinedInferenceAgreement",
     "Gate",
     "GateStatus",

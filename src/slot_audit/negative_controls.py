@@ -404,8 +404,19 @@ def build_control_config(epoch: SimulatedEpoch) -> EpochAuditConfig:
 
 
 def resolve_control_config(
-    config: EpochAuditConfig, *, car_path: Path
+    config: EpochAuditConfig,
+    *,
+    car_path: Path,
+    urls: tuple[str, str] = (PROVIDER_A_URL, PROVIDER_B_URL),
 ) -> ResolvedEpochAuditConfig:
+    """Resolve a fixture configuration without consulting the environment.
+
+    ``urls`` is a parameter so a fixture can construct the degenerate case of two
+    providers resolving to one endpoint. :func:`resolve_epoch_config` refuses to
+    build that from real configuration, which is why the ``distinct_endpoints``
+    gate needs another route to be exercised at all.
+    """
+
     providers = tuple(
         ResolvedProvider(
             name=model.name,
@@ -415,7 +426,7 @@ def resolve_control_config(
             endpoint_fingerprint=endpoint_fingerprint(url),
             host_fingerprint=endpoint_host_fingerprint(url),
         )
-        for model, url in zip(config.providers, (PROVIDER_A_URL, PROVIDER_B_URL), strict=True)
+        for model, url in zip(config.providers, urls, strict=True)
     )
     return ResolvedEpochAuditConfig(
         config=config,
