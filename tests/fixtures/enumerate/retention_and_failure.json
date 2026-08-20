@@ -1,8 +1,0 @@
-{
-  "provider": "retained",
-  "first_available_block": 103,
-  "responses": {
-    "103-106": {"result": [103, 105]},
-    "107-110": {"error": "recorded getBlocks failure"}
-  }
-}

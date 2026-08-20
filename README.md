@@ -21,21 +21,22 @@ jump, so an error message is never evidence of provider loss.
 >
 > Do not cite this repository as evidence about any provider.
 
-The repository contains two things:
+The tool is a fail-closed instrument scoped to exactly one complete epoch,
+exactly two genuinely distinct RPC providers, and exactly one legacy SPL Token
+mint, anchored to a verified Old Faithful CAR.
 
-* **Pass A** (`enumerate`) — a cheap, resumable cross-provider diff. It is
-  **reconnaissance only**. It issues no direct `getBlock`, obtains no explicit
-  denial from any provider, and therefore cannot distinguish a data hole from a
-  silently truncated response. Every row it emits is `UNCONFIRMED_OMISSION`.
-  Rows from Pass A must never be presented as findings about a provider.
-* **The single-epoch audit** (`audit`) — a fail-closed instrument scoped to
-  exactly one complete epoch, exactly two genuinely distinct RPC providers, and
-  exactly one legacy SPL Token mint, anchored to a verified Old Faithful CAR.
+It used to ship a second, cheaper pass as well: a cross-provider diff with no
+anchor and no direct confirmation. That pass could only ever produce candidates,
+but it shared this one's vocabulary, and sharing a vocabulary across two
+evidence standards is how a mere discrepancy came to be labelled a proven
+`PROVIDER_HOLE`. Renaming fixed the symptom; removing the pass fixed the cause.
+An unanchored run of this audit produces the same reconnaissance as indeterminate
+matters, correctly labelled.
 
 The canonical package is `src/slot_audit/` (see `pyproject.toml`). The
 distribution is named `solana-slot-audit`; the importable module is `slot_audit`.
 
-## The single-epoch audit
+## Running an audit
 
 ```bash
 PYTHONPATH=src python3 -m slot_audit audit \
@@ -308,7 +309,6 @@ Python 3.11 or newer.
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
-cp config.example.yaml config.yaml          # Pass A
 cp .env.example .env
 ```
 
@@ -333,26 +333,6 @@ root CID are identical on every machine.
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
-
-## Pass A
-
-```bash
-PYTHONPATH=src python3 -m slot_audit enumerate --config config.yaml --results-dir results
-```
-
-Writes `raw.jsonl` / `raw-cross-provider-diff.jsonl` (one **unconfirmed**
-omission per `(provider, slot)`), `enumeration-summary.json`, a resumable
-checkpoint, and `run.log`. Retention is checked before and after enumeration;
-slots below the later `getFirstAvailableBlock` boundary are excluded. Result
-files contain provider names, not credential-bearing URLs.
-
-**What a Pass A row is not.** Each row records that one provider omitted a slot
-another returned, and nothing more. Every row carries `confirmed: false`,
-`conclusive: false`, `direct_getblock_issued: false` and an
-`unexcluded_explanations` list naming silent gateway truncation — which produces
-an identical signature — alongside a genuine data hole. Confirming an omission
-requires the single-epoch audit: a direct `getBlock`, a semantically explicit
-denial, and a ground-truth anchor.
 
 ## What this does not prove
 
@@ -392,8 +372,6 @@ Residual assumptions worth knowing before citing any future finding:
   returns null for a slot it holds would still produce a conclusive finding.
 - The evidence manifest is unsigned. It detects damage and naive edits, not a
   forger with write access who also rewrites the manifest.
-- Pass A rows are never confirmations of anything, whatever they look like in
-  bulk.
 
 Beyond that: measuring block presence does not establish that anyone was harmed
 by a missing block. This audit does not prove transaction-level completeness,
