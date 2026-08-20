@@ -312,6 +312,14 @@ python3.12 -m venv .venv
 cp .env.example .env
 ```
 
+## Review history
+
+`REVIEW-LOG.md` records four rounds of adversarial review: twenty-four claims
+tested, fourteen corrected, ten that held, eight limits that remain. It is
+organised by finding, and every entry cites the commit, test name or command
+that substantiates it — statements traceable only to correspondence are marked
+pending rather than written as fact. The error log records both sides.
+
 ## Fixtures are deliberately messy
 
 Three defects reached review because every fixture answered perfectly on the
