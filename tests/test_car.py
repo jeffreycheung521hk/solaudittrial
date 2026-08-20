@@ -135,6 +135,26 @@ class SectionCeilingTests(unittest.TestCase):
             list(iter_car_blocks(hostile))
 
 
+class HostileInputTests(unittest.TestCase):
+    def test_an_oversized_header_length_is_refused(self) -> None:
+        from slot_audit.car import MAX_CAR_HEADER_BYTES, _encode_varint
+
+        hostile = io.BytesIO(_encode_varint(MAX_CAR_HEADER_BYTES + 1) + b"\x00")
+
+        with self.assertRaisesRegex(CarError, "ceiling"):
+            read_car_header(hostile)
+
+    def test_deep_nesting_raises_a_car_error_not_a_recursion_error(self) -> None:
+        from slot_audit.car import MAX_CBOR_DEPTH
+
+        payload = cbor_encode(1)
+        for _ in range(MAX_CBOR_DEPTH + 10):
+            payload = b"\x81" + payload  # array of one
+
+        with self.assertRaisesRegex(CborError, "depth limit"):
+            cbor_decode(payload)
+
+
 class Base58Tests(unittest.TestCase):
     def test_only_32_byte_values_look_like_blockhashes(self) -> None:
         self.assertTrue(is_base58_hash("1" * 32))

@@ -301,33 +301,67 @@ class ProviderEnumeration:
         return tuple(self.iter_candidate_gap_ranges())
 
 
+#: Explanations that cross-provider presence alone cannot rule out. They are
+#: carried on every Pass-A row so a reader cannot mistake the row for a finding.
+UNEXCLUDED_EXPLANATIONS: tuple[str, ...] = (
+    "the provider silently truncated an otherwise successful getBlocks response "
+    "(HTTP 200, well-formed JSON, incomplete list) -- a documented behaviour of "
+    "commercial RPC gateways under internal response limits",
+    "a transient backend inconsistency that a direct getBlock would not reproduce",
+    "a genuine provider data hole",
+)
+
+
 @dataclass(frozen=True, slots=True)
-class CrossProviderHole:
-    """Conclusive Pass-A evidence that one provider omitted a real block."""
+class CrossProviderOmission:
+    """A Pass-A *discrepancy*: one provider omitted a slot another returned.
+
+    This is deliberately not a finding. Pass A never issues a direct ``getBlock``
+    and therefore never obtains a semantically explicit denial from the provider,
+    so it cannot separate a data hole from a silently truncated response. The
+    single-epoch audit exists precisely to make that separation, against a
+    ground-truth anchor; this class must not borrow its authority.
+    """
 
     provider: str
     slot: int
     corroborating_providers: tuple[str, ...]
     reasoning: str
-    verdict: Verdict = field(default=Verdict.PROVIDER_HOLE, init=False)
+    verdict: Verdict = field(default=Verdict.UNCONFIRMED_OMISSION, init=False)
 
     def __post_init__(self) -> None:
         _validate_slot(self.slot, "slot")
         if not self.provider:
             raise ValueError("provider name must not be empty")
         if not self.corroborating_providers:
-            raise ValueError("a cross-provider hole needs at least one corroborating provider")
+            raise ValueError(
+                "a cross-provider omission needs at least one corroborating provider"
+            )
         if self.provider in self.corroborating_providers:
             raise ValueError("a provider cannot corroborate itself")
         if not self.reasoning:
             raise ValueError("reasoning must be human-readable and non-empty")
 
     @property
+    def confirmed(self) -> bool:
+        """Always false. Pass A has no confirmation mechanism at all."""
+
+        return False
+
+    @property
     def evidence(self) -> dict[str, object]:
         return {
             "corroborating_providers": list(self.corroborating_providers),
             "reasoning": self.reasoning,
+            "confirmed": False,
+            "confirmation_method": None,
+            "unexcluded_explanations": list(UNEXCLUDED_EXPLANATIONS),
         }
+
+
+#: Retained so existing callers keep importing successfully. The old name made a
+#: claim the class never supported.
+CrossProviderHole = CrossProviderOmission
 
 
 CheckpointCallback: TypeAlias = Callable[[ChunkEnumeration], Awaitable[None] | None]
@@ -462,13 +496,16 @@ async def enumerate_provider(
 
 def iter_cross_provider_holes(
     enumerations: Iterable[ProviderEnumeration],
-) -> Iterator[CrossProviderHole]:
-    """Merge sorted provider results and yield conclusive omissions.
+) -> Iterator[CrossProviderOmission]:
+    """Merge sorted provider results and yield *unconfirmed* omissions.
 
-    A finding is emitted only when the target successfully audited that exact
-    slot and omitted it, while at least one other successfully audited provider
-    returned it.  Thus retention and failed chunks cannot become false holes.
-    Memory use is O(number of providers), apart from yielded findings.
+    A row is emitted only when the target successfully audited that exact slot
+    and omitted it, while at least one other successfully audited provider
+    returned it. That excludes retention boundaries and failed chunks as causes,
+    but it does not exclude silent truncation, and Pass A has no mechanism that
+    could. Every row is therefore UNCONFIRMED_OMISSION, never PROVIDER_HOLE.
+
+    Memory use is O(number of providers), apart from yielded rows.
     """
 
     results = tuple(enumerations)
@@ -518,10 +555,14 @@ def iter_cross_provider_holes(
             joined = ", ".join(corroborators)
             reasoning = (
                 f"{target.provider} successfully enumerated the range containing slot "
-                f"{slot} but omitted it; {joined} returned slot {slot}, proving that "
-                "the block existed and that this omission is a provider data hole"
+                f"{slot} but omitted it, while {joined} returned slot {slot}. That is "
+                "the whole of the observation. Pass A issued no direct getBlock and "
+                f"obtained no explicit denial from {target.provider}, so it has NOT "
+                "established that this is a provider data hole; silent response "
+                "truncation produces an identical signature. Treat this as a "
+                "candidate for confirmation, never as a finding"
             )
-            yield CrossProviderHole(
+            yield CrossProviderOmission(
                 provider=target.provider,
                 slot=slot,
                 corroborating_providers=corroborators,
@@ -720,9 +761,11 @@ def _normalize_resume_chunks(
 
 __all__ = [
     "MAX_GET_BLOCKS_SLOTS",
+    "UNEXCLUDED_EXPLANATIONS",
     "CheckpointCallback",
     "ChunkEnumeration",
     "CrossProviderHole",
+    "CrossProviderOmission",
     "EnumerationClient",
     "ProviderEnumeration",
     "SlotRange",

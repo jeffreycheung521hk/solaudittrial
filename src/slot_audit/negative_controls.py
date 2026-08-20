@@ -58,6 +58,7 @@ from .evidence import EvidenceStore, endpoint_fingerprint, endpoint_host_fingerp
 from .groundtruth import (
     BLOCK_NODE_KIND,
     CarBlockHeaderExtractor,
+    ConstantProvenance,
     EpochGroundTruthSpec,
     GroundTruthHeader,
 )
@@ -190,6 +191,17 @@ def build_simulated_epoch(
         car_root_cid=root_cid.encode(),
         car_sha256=hashlib.sha256(car_bytes).hexdigest(),
         source_commit=CONTROL_SOURCE_COMMIT,
+        provenance=ConstantProvenance(
+            source=(
+                "generated deterministically by build_simulated_epoch in this "
+                "repository"
+            ),
+            verified_against_archive=True,
+            note=(
+                "The digest and root CID are computed from the archive bytes that "
+                "were just built, so they describe this archive by construction."
+            ),
+        ),
     )
 
     accounts = tuple(
@@ -431,7 +443,6 @@ async def run_control_audit(
     defects_by_provider: Mapping[str, LedgerDefects],
     now: Callable[[], str] = utc_now,
     run_negative_controls: bool = False,
-    epoch_override: SimulatedEpoch | None = None,
 ) -> AuditRun:
     """Run the real audit against the fixture epoch through a scripted transport."""
 

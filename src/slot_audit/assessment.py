@@ -40,6 +40,7 @@ MANDATORY_GATES: tuple[str, ...] = (
     "negative_control_provider_hole",
     "negative_control_token_truncation",
     "negative_control_previous_blockhash",
+    "ground_truth_constants_provenance",
     "ground_truth_provenance_binding",
     "ground_truth_full_epoch_coverage",
     "per_provider_agreement",
@@ -121,13 +122,27 @@ class Gate:
 
 @dataclass(frozen=True, slots=True)
 class ProviderAgreement:
-    """Per-provider agreement, reported separately from the combined inference."""
+    """One provider's agreement with the anchor, plus how much it could answer.
+
+    There is deliberately only **one** agreement number here. Against a binary
+    ground truth (produced / skipped) a provider's "availability agreement" and
+    its "classification agreement" are the same quantity computed twice: the
+    provider is right about availability exactly when its unaided
+    present-or-skipped inference matches the anchor. An earlier version of this
+    class reported both, and a reader could have cited two independent-looking
+    figures that were one measurement. Reporting it once is the correction.
+
+    ``coverage_completeness`` is a genuinely different quantity: it is how much
+    of the epoch this provider successfully enumerated at all, scored over every
+    scheduled position and independent of what the anchor says. A provider can
+    have perfect agreement over the tenth of the epoch it managed to answer for.
+    """
 
     provider: str
     classification_numerator: int
     classification_denominator: int
-    availability_numerator: int
-    availability_denominator: int
+    covered_positions: int
+    scheduled_positions: int
     indeterminate_count: int
     denominator_policy: str
 
@@ -136,26 +151,40 @@ class ProviderAgreement:
         return exact_rate(self.classification_numerator, self.classification_denominator)
 
     @property
-    def availability_rate(self) -> Fraction | None:
-        return exact_rate(self.availability_numerator, self.availability_denominator)
+    def coverage_rate(self) -> Fraction | None:
+        return exact_rate(self.covered_positions, self.scheduled_positions)
 
     def to_payload(self) -> dict[str, object]:
         return {
             "provider": self.provider,
             "classification_agreement": {
+                "definition": (
+                    "positions where this provider's unaided present-or-skipped "
+                    "inference matched the anchor, over positions where both were "
+                    "determinate"
+                ),
                 "numerator": self.classification_numerator,
                 "denominator": self.classification_denominator,
                 "rate": format_rate(self.classification_rate),
                 "percent": format_percent(self.classification_rate),
             },
-            "availability_agreement": {
-                "numerator": self.availability_numerator,
-                "denominator": self.availability_denominator,
-                "rate": format_rate(self.availability_rate),
-                "percent": format_percent(self.availability_rate),
+            "coverage_completeness": {
+                "definition": (
+                    "scheduled positions this provider successfully enumerated, "
+                    "over all scheduled positions; independent of the anchor"
+                ),
+                "numerator": self.covered_positions,
+                "denominator": self.scheduled_positions,
+                "rate": format_rate(self.coverage_rate),
+                "percent": format_percent(self.coverage_rate),
             },
             "indeterminate_count": self.indeterminate_count,
             "denominator_policy": self.denominator_policy,
+            "note": (
+                "Agreement is reported once. Against a binary ground truth, "
+                "availability agreement and classification agreement are the same "
+                "quantity; presenting both would be one measurement counted twice."
+            ),
         }
 
 
@@ -202,6 +231,19 @@ class InstrumentAssessment:
         missing = [name for name in MANDATORY_GATES if name not in set(seen)]
         if missing:
             raise ValueError(f"assessment is missing mandatory gate(s): {', '.join(missing)}")
+        # Presence is not enough. A gate named in MANDATORY_GATES but carrying
+        # mandatory=False would be silently advisory, and a failing one would no
+        # longer force NO_CONCLUSION -- a downgrade that reads as a passing run.
+        demoted = [
+            gate.gate_id
+            for gate in self.gates
+            if gate.gate_id in MANDATORY_GATES and not gate.mandatory
+        ]
+        if demoted:
+            raise ValueError(
+                "these gates are mandatory and may not be marked advisory: "
+                + ", ".join(sorted(demoted))
+            )
 
     def gate(self, gate_id: str) -> Gate:
         for gate in self.gates:

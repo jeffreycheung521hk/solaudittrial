@@ -23,9 +23,11 @@ jump, so an error message is never evidence of provider loss.
 
 The repository contains two things:
 
-* **Pass A** (`enumerate`) — a cheap, resumable cross-provider diff. Useful for
-  reconnaissance; it cannot tell a protocol skip from a hole unless another
-  provider happens to have the block.
+* **Pass A** (`enumerate`) — a cheap, resumable cross-provider diff. It is
+  **reconnaissance only**. It issues no direct `getBlock`, obtains no explicit
+  denial from any provider, and therefore cannot distinguish a data hole from a
+  silently truncated response. Every row it emits is `UNCONFIRMED_OMISSION`.
+  Rows from Pass A must never be presented as findings about a provider.
 * **The single-epoch audit** (`audit`) — a fail-closed instrument scoped to
   exactly one complete epoch, exactly two genuinely distinct RPC providers, and
   exactly one legacy SPL Token mint, anchored to a verified Old Faithful CAR.
@@ -57,6 +59,7 @@ renders it; neither recomputes a gate. Any failed mandatory gate forces
 | `negative_control_provider_hole` | Removing a block known to exist yields `PROVIDER_HOLE`, never `PROTOCOL_SKIPPED` |
 | `negative_control_token_truncation` | A dropped account under-reports supply by exactly its balance |
 | `negative_control_previous_blockhash` | A corrupted `previousBlockhash` surfaces as `PREVIOUS_BLOCKHASH_MISMATCH` |
+| `ground_truth_constants_provenance` | The pinned constants trace to an authority — **currently fails for epoch 100** |
 | `ground_truth_provenance_binding` | The archive is the pinned one, structurally and by digest |
 | `ground_truth_full_epoch_coverage` | Every scheduled position of the epoch is accounted for |
 | `per_provider_agreement` | Each provider separately meets the configured minimum |
@@ -66,7 +69,8 @@ renders it; neither recomputes a gate. Any failed mandatory gate forces
 | `finding_evidence_completeness` | Every conclusive finding carries what a reviewer needs to re-perform it |
 | `manifest_provenance_completeness` | Evidence is complete, unmodified and fully attributed |
 
-`hash_link_continuity` and `token_supply_reconciliation` are reported but are
+`hash_link_continuity`, `token_supply_reconciliation` and `materiality_assessment`
+are reported but are
 **not** mandatory: their failure is a *finding about the providers*, not a
 malfunction of the instrument, and conflating the two would make every real
 finding suppress its own result.
@@ -78,16 +82,25 @@ when both omit a slot, was it skipped by the protocol or lost by both? An anchor
 that an arbitrary file can satisfy answers nothing, so the binding is narrow.
 
 1. **The pinned constants live in `src/slot_audit/groundtruth.py`**, not in
-   configuration. For epoch 100: first slot 43,200,000; last slot 43,631,999;
-   432,000 scheduled positions; 402,076 produced blocks; 29,924 skipped slots;
-   predecessor boundary row 43,199,999; CAR root CID
-   `bafyreibqt2nvroysxlxctgb52xxn27ectsllv2xyka4qar7ga6vupmbs3i`; CAR SHA-256
-   `9f6d631833a8dfe0a4253ceede8e4af18a63603f0131a71ca5e947ba77eaec5a`; Old
-   Faithful source commit `a69a0d2e189006608e3b73b7659a957b00b3567e`.
-   `config.epoch-100.yaml` must restate every one of them — an unstated
-   assumption is not auditable — but restating a *wrong* value fails the run
-   rather than redefining the constant. **A digest a user typed can never bless
-   a file.**
+   configuration. `config.epoch-100.yaml` must restate every one of them — an
+   unstated assumption is not auditable — but restating a *wrong* value fails the
+   run rather than redefining the constant. **A digest a user typed can never
+   bless a file.**
+
+   > **The epoch-100 constants are not verified, and the run is blocked because
+   > of it.** The values in this build (402,076 produced blocks, 29,924 skipped,
+   > CAR SHA-256 `9f6d63…ec5a`, root CID `bafyrei…mbs3i`, source commit
+   > `a69a0d2e…`) were supplied by the specification that commissioned the tool.
+   > No citation to an Old Faithful release or index came with them, and nobody
+   > here has held the archive, so the digest cannot have been measured. They are
+   > recorded as `verified_against_archive: false`, the mandatory
+   > `ground_truth_constants_provenance` gate fails, and **an epoch-100 run
+   > concludes nothing today.**
+   >
+   > The fix is to reconcile the values against a published Old Faithful source
+   > and set the provenance. Editing the constants to match a file you already
+   > hold is *not* the fix — it inverts the check and turns the anchor into
+   > whatever archive you started with.
 2. **The archive must be the archive.** It must hash to the pinned digest, parse
    as CAR v1, declare exactly the pinned root CID, contain that root block, and
    every block must be addressed by its own CID. A single flipped byte anywhere
@@ -131,15 +144,24 @@ The manifest records `write_order`, so a reviewer can confirm the inference was
 frozen before the result it is compared against existed. The encoding is
 run-length but lossless.
 
-### Agreement is reported four ways, never merged
+### Agreement, reported once per provider
 
-Per provider: **classification agreement** (how often that endpoint's unaided
+Each provider gets **one** agreement figure: how often its unaided
 "present, so produced / missing, so skipped" inference matched the anchor, over
-the audit population) and **availability agreement** (how often it matched over
-its own successful coverage). Separately, the **combined two-provider existence
-inference agreement**, which is a different quantity and is labelled as one.
-Each is reported with numerator, denominator, rate, indeterminate count and the
-declared denominator policy.
+positions where both were determinate. Against a binary ground truth there is
+only one such quantity — a provider is right about availability exactly when
+that inference is right — so reporting an "availability agreement" beside it
+would be one measurement printed twice. An earlier version of this tool did
+exactly that; it was corrected.
+
+Alongside it, **coverage completeness**: how much of the epoch the provider
+successfully enumerated at all, over every scheduled position, independent of
+the anchor. That is genuinely different — a provider can agree perfectly about
+the tenth of the epoch it managed to answer for.
+
+Separately again, the **combined two-provider existence inference agreement**,
+a different quantity and labelled as one. Each figure carries numerator,
+denominator, rate, indeterminate count and the declared denominator policy.
 
 ### Evidence
 
@@ -150,10 +172,13 @@ host fingerprint, and a shared host is rejected: that is one upstream wearing tw
 names.
 
 A conclusive `PROVIDER_HOLE` additionally requires the provider to **answer**
-that it has no block: a null result, or `-32007`/`-32009`. A direct `getBlock`
-that failed for any other reason — an exhausted request budget, a transport
-fault, a node that never became healthy, or `-32001` "below retention" — is the
-audit failing to ask, not the provider failing to serve. Those record an
+that it has no block: `-32007`/`-32009`, or a null result confirmed by a second
+independent read. A bare null is a *successful* response, so the transport never
+retries it, and gateway layers have been observed returning one for an edge-cache
+miss on a slot they do hold — one unreplicated null is not enough. A direct
+`getBlock` that failed for any other reason — an exhausted request budget, a
+transport fault, a node that never became healthy, or `-32001` "below retention"
+— is the audit failing to ask, not the provider failing to serve. Those record an
 indeterminate matter instead. Not asking is not evidence of absence.
 
 Every conclusive block finding carries non-null `slot`, `blockhash`,
@@ -164,9 +189,16 @@ If a required ground-truth header cannot be retrieved or derived, the run record
 an indeterminate matter and concludes nothing — it never emits a hole with null
 hashes.
 
+`summary.md` and `result.json` are themselves manifested artifacts. The copies
+beside the evidence directory are byte-identical to the sealed ones, so editing
+the readable conclusion is detectable — `verify-evidence` compares them.
+
 Manifest verification is closed-world (missing, modified **and** unexpected
 unmanifested files), and a store refuses to open on a directory that already
-holds a run, so evidence is never silently overwritten:
+holds a run, so evidence is never silently overwritten. The manifest is
+**unsigned**: it rules out damage, partial loss and naive editing, but not an
+editor who also recomputes the affected digest and rewrites the manifest. It is
+an integrity check, not an authenticity one.
 
 ```bash
 PYTHONPATH=src python3 -m slot_audit verify-evidence \
@@ -196,7 +228,9 @@ and denominator policy, materiality threshold, minimum provider agreement, token
 program id, account size, mint/amount/state/supply offsets, included account
 states, zero-balance policy, duplicate-pubkey policy, hash-link validation
 population, request limits, and the ground-truth source and expected hashes.
-Unknown keys fail; missing keys fail.
+Unknown keys fail; missing keys fail. `materiality_threshold` is applied by the
+`materiality_assessment` gate, which weighs the finding rate and the token
+discrepancy against it.
 
 Thresholds must be quoted (`"0.01"`). An unquoted YAML `0.01` is a binary float
 and is rejected: comparisons use `Decimal` and exact `Fraction` arithmetic
@@ -229,11 +263,19 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -
 PYTHONPATH=src python3 -m slot_audit enumerate --config config.yaml --results-dir results
 ```
 
-Writes `raw.jsonl` / `raw-cross-provider-diff.jsonl` (one conclusive omission per
-`(provider, slot)`), `enumeration-summary.json`, a resumable checkpoint, and
-`run.log`. Retention is checked before and after enumeration; slots below the
-later `getFirstAvailableBlock` boundary are excluded, never called holes. Result
+Writes `raw.jsonl` / `raw-cross-provider-diff.jsonl` (one **unconfirmed**
+omission per `(provider, slot)`), `enumeration-summary.json`, a resumable
+checkpoint, and `run.log`. Retention is checked before and after enumeration;
+slots below the later `getFirstAvailableBlock` boundary are excluded. Result
 files contain provider names, not credential-bearing URLs.
+
+**What a Pass A row is not.** Each row records that one provider omitted a slot
+another returned, and nothing more. Every row carries `confirmed: false`,
+`conclusive: false`, `direct_getblock_issued: false` and an
+`unexcluded_explanations` list naming silent gateway truncation — which produces
+an identical signature — alongside a genuine data hole. Confirming an omission
+requires the single-epoch audit: a direct `getBlock`, a semantically explicit
+denial, and a ground-truth anchor.
 
 ## What this does not prove
 
@@ -241,8 +283,11 @@ files contain provider names, not credential-bearing URLs.
 performed. The code, the gates and the deterministic integration tests are
 complete; the inputs are not. To run it for real you need:
 
-1. the Old Faithful epoch-100 CAR (62.9 GB) whose SHA-256 is
-   `9f6d631833a8dfe0a4253ceede8e4af18a63603f0131a71ca5e947ba77eaec5a`, at
+0. **provenance for the pinned constants** — a citation to a published Old
+   Faithful source establishing the epoch-100 digest, root CID and block counts.
+   Without it the mandatory `ground_truth_constants_provenance` gate fails and
+   nothing else matters;
+1. the Old Faithful epoch-100 CAR reported to be 62.9 GB, at
    `$OLD_FAITHFUL_EPOCH_100_CAR`;
 2. credentials for two genuinely distinct archive-capable providers whose
    retention covers slots 43,200,000–43,631,999, in `$PROVIDER_A_URL` and

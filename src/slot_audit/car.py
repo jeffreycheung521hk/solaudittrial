@@ -26,6 +26,14 @@ from typing import Any, BinaryIO
 #: bytes, so the reader refuses rather than attempting the allocation.
 MAX_CAR_SECTION_BYTES = 128 * 1024 * 1024
 
+#: The header is a small map of roots. Anything larger is a hostile length claim.
+MAX_CAR_HEADER_BYTES = 1024 * 1024
+
+#: DAG-CBOR in this application is shallow. A deeply nested payload would
+#: otherwise exhaust the interpreter stack and escape as RecursionError rather
+#: than as the CarError the callers handle.
+MAX_CBOR_DEPTH = 64
+
 DAG_CBOR_CODEC = 0x71
 RAW_CODEC = 0x55
 SHA2_256 = 0x12
@@ -196,7 +204,7 @@ def _read_cid(data: bytes, offset: int) -> tuple[Cid, int]:
 
 
 def cbor_decode(data: bytes) -> Any:
-    value, offset = _cbor_decode_at(data, 0)
+    value, offset = _cbor_decode_at(data, 0, 0)
     if offset != len(data):
         raise CborError("trailing bytes after CBOR value")
     return value
@@ -220,7 +228,9 @@ def _cbor_head(data: bytes, offset: int) -> tuple[int, int, int]:
     raise CborError("indefinite-length and reserved CBOR items are not accepted")
 
 
-def _cbor_decode_at(data: bytes, offset: int) -> tuple[Any, int]:
+def _cbor_decode_at(data: bytes, offset: int, depth: int = 0) -> tuple[Any, int]:
+    if depth > MAX_CBOR_DEPTH:
+        raise CborError(f"CBOR nesting exceeds the depth limit of {MAX_CBOR_DEPTH}")
     major, argument, offset = _cbor_head(data, offset)
     if major == 0:
         return argument, offset
@@ -241,24 +251,24 @@ def _cbor_decode_at(data: bytes, offset: int) -> tuple[Any, int]:
     if major == 4:
         items = []
         for _ in range(argument):
-            item, offset = _cbor_decode_at(data, offset)
+            item, offset = _cbor_decode_at(data, offset, depth + 1)
             items.append(item)
         return items, offset
     if major == 5:
         mapping: dict[str, Any] = {}
         for _ in range(argument):
-            key, offset = _cbor_decode_at(data, offset)
+            key, offset = _cbor_decode_at(data, offset, depth + 1)
             if not isinstance(key, str):
                 raise CborError("DAG-CBOR map keys must be text strings")
             if key in mapping:
                 raise CborError("DAG-CBOR maps must not repeat a key")
-            value, offset = _cbor_decode_at(data, offset)
+            value, offset = _cbor_decode_at(data, offset, depth + 1)
             mapping[key] = value
         return mapping, offset
     if major == 6:
         if argument != CID_TAG:
             raise CborError(f"unsupported CBOR tag {argument}")
-        payload, offset = _cbor_decode_at(data, offset)
+        payload, offset = _cbor_decode_at(data, offset, depth + 1)
         if not isinstance(payload, (bytes, bytearray)) or not payload or payload[0] != 0:
             raise CborError("CID tag payload must be an identity-prefixed byte string")
         cid, consumed = _read_cid(bytes(payload), 1)
@@ -343,6 +353,11 @@ def read_car_header(stream: BinaryIO) -> CarHeader:
     length = _read_varint_stream(stream)
     if length is None or length == 0:
         raise CarError("CAR file has no header")
+    if length > MAX_CAR_HEADER_BYTES:
+        raise CarError(
+            f"CAR header claims {length} bytes, above the "
+            f"{MAX_CAR_HEADER_BYTES} byte ceiling"
+        )
     header_bytes = stream.read(length)
     if len(header_bytes) != length:
         raise CarError("CAR header is truncated")
@@ -397,7 +412,9 @@ def encode_car(roots: list[Cid], blocks: list[CarBlock]) -> bytes:
 
 __all__ = [
     "CID_TAG",
+    "MAX_CAR_HEADER_BYTES",
     "MAX_CAR_SECTION_BYTES",
+    "MAX_CBOR_DEPTH",
     "DAG_CBOR_CODEC",
     "RAW_CODEC",
     "SHA2_256",

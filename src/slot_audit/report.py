@@ -83,7 +83,10 @@ def render_summary(run: AuditRun, *, results_dir: str | Path) -> str:
     add(f"- Exact-context policy: `{scope_block.get('exact_context_policy')}`")
     add(f"- Indeterminate threshold: `{thresholds.get('indeterminate_threshold')}`")
     add(f"- Denominator policy: `{thresholds.get('denominator_policy')}`")
-    add(f"- Materiality threshold: `{thresholds.get('materiality_threshold')}`")
+    add(
+        f"- Materiality threshold: `{thresholds.get('materiality_threshold')}` "
+        "(applied by the `materiality_assessment` gate)"
+    )
     add(f"- Minimum provider agreement: `{thresholds.get('minimum_provider_agreement')}`")
     add(f"- Token mint: `{token.get('mint')}`")
     add(f"- Token program id: `{token.get('program_id')}`")
@@ -149,23 +152,32 @@ def render_summary(run: AuditRun, *, results_dir: str | Path) -> str:
         "how often the pair, taken together, inferred existence correctly."
     )
     add("")
+    add(
+        "**Each provider has exactly one agreement figure.** Against a binary ground "
+        "truth, a provider is right about availability exactly when its unaided "
+        "present-or-skipped inference is right, so an \"availability agreement\" "
+        "column would be this same number printed twice. Coverage completeness below "
+        "is a different quantity: how much of the epoch the provider could answer for "
+        "at all, independent of the anchor."
+    )
+    add("")
     add("### Per-provider agreement")
     add("")
     add(
         "| Provider | Classification agreement | Numerator/Denominator | "
-        "Availability agreement | Numerator/Denominator | Indeterminate | "
+        "Coverage completeness | Covered/Scheduled | Indeterminate | "
         "Denominator policy |"
     )
     add("| --- | --- | --- | --- | --- | --- | --- |")
     for agreement in run.provider_agreements:
         payload = agreement.to_payload()
         classification = payload["classification_agreement"]
-        availability = payload["availability_agreement"]
+        coverage = payload["coverage_completeness"]
         add(
             f"| `{agreement.provider}` | {classification['percent']} | "
             f"{classification['numerator']}/{classification['denominator']} | "
-            f"{availability['percent']} | "
-            f"{availability['numerator']}/{availability['denominator']} | "
+            f"{coverage['percent']} | "
+            f"{coverage['numerator']}/{coverage['denominator']} | "
             f"{agreement.indeterminate_count} | `{agreement.denominator_policy}` |"
         )
     add("")
@@ -207,6 +219,16 @@ def render_summary(run: AuditRun, *, results_dir: str | Path) -> str:
     add("")
     truth = run.ground_truth
     add(f"- Source: Old Faithful CAR for epoch {truth.spec.epoch}")
+    provenance = truth.spec.provenance
+    if not provenance.verified_against_archive:
+        add("")
+        add(
+            f"> **The pinned constants below are unverified.** {provenance.note} "
+            f"Stated source: {provenance.source}."
+        )
+        add("")
+    else:
+        add(f"- Constants provenance: verified — {provenance.source}")
     add(f"- Pinned CAR sha256: `{truth.spec.car_sha256}`")
     add(f"- Observed CAR sha256: `{truth.car_sha256}`")
     add(f"- Pinned CAR root CID: `{truth.spec.car_root_cid}`")
@@ -351,6 +373,13 @@ def render_summary(run: AuditRun, *, results_dir: str | Path) -> str:
             f"- Manifest: `{run.manifest.relative_path}` — sha256 "
             f"`{run.manifest.sha256}`, {run.manifest.byte_length} bytes"
         )
+    else:
+        add(
+            "- Manifest: sealed after this document was recorded. This summary is "
+            "itself a manifested artifact (`artifacts/summary.md`), so tampering "
+            "with the copy beside the evidence directory is detectable by "
+            "comparing it against the sealed one."
+        )
     add("")
 
     add("## Re-performance")
@@ -388,19 +417,79 @@ def render_summary(run: AuditRun, *, results_dir: str | Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_result_bytes(run: AuditRun) -> bytes:
+    """Serialize the machine-readable result deterministically."""
+
+    return (
+        json.dumps(run.to_payload(), indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+
+
 def write_reports(run: AuditRun, *, results_dir: str | Path) -> tuple[Path, Path]:
-    """Write ``summary.md`` and ``result.json`` beside the evidence directory."""
+    """Place readable copies of the sealed reports beside the evidence directory.
+
+    The bytes are *copied* from the manifested artifacts rather than re-rendered,
+    so the convenience copy and the sealed record are byte-identical and any edit
+    to the copy is detectable. If a run predates sealing (or was constructed by
+    hand in a test), rendering falls back to generating them directly.
+    """
 
     directory = Path(results_dir)
     directory.mkdir(parents=True, exist_ok=True)
     summary_path = directory / SUMMARY_NAME
     result_path = directory / RESULT_NAME
-    summary_path.write_text(render_summary(run, results_dir=directory), encoding="utf-8")
-    result_path.write_text(
-        json.dumps(run.to_payload(), indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+
+    sealed_summary = _sealed_bytes(run, run.summary_evidence)
+    sealed_result = _sealed_bytes(run, run.result_evidence)
+    summary_path.write_bytes(
+        sealed_summary
+        if sealed_summary is not None
+        else render_summary(run, results_dir=directory).encode("utf-8")
+    )
+    result_path.write_bytes(
+        sealed_result if sealed_result is not None else render_result_bytes(run)
     )
     return summary_path, result_path
 
 
-__all__ = ["RESULT_NAME", "SUMMARY_NAME", "render_summary", "write_reports"]
+def _sealed_bytes(run: AuditRun, ref: EvidenceRef | None) -> bytes | None:
+    if ref is None:
+        return None
+    path = Path(run.evidence_root) / ref.relative_path
+    return path.read_bytes() if path.is_file() else None
+
+
+def verify_reports(results_dir: str | Path, evidence_dir: str | Path) -> list[str]:
+    """Compare the readable copies against the sealed originals.
+
+    Returns a list of problems; an empty list means the copies are faithful.
+    """
+
+    problems: list[str] = []
+    results = Path(results_dir)
+    evidence = Path(evidence_dir)
+    for name in (SUMMARY_NAME, RESULT_NAME):
+        copy = results / name
+        sealed = evidence / "artifacts" / name
+        if not sealed.is_file():
+            if copy.is_file():
+                problems.append(f"{name} exists beside the evidence but was never sealed")
+            continue
+        if not copy.is_file():
+            continue
+        if copy.read_bytes() != sealed.read_bytes():
+            problems.append(
+                f"{name} differs from the sealed artifacts/{name}; the readable copy "
+                "has been modified"
+            )
+    return problems
+
+
+__all__ = [
+    "RESULT_NAME",
+    "SUMMARY_NAME",
+    "render_result_bytes",
+    "render_summary",
+    "verify_reports",
+    "write_reports",
+]

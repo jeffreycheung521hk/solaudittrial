@@ -409,6 +409,25 @@ class SingleAssessmentTests(EpochAuditTestCase):
             with self.subTest(symbol=forbidden):
                 self.assertNotIn(forbidden, source)
 
+    def test_a_mandatory_gate_cannot_be_relabelled_advisory(self) -> None:
+        """Demoting a gate would let a failing check stop forcing NO_CONCLUSION."""
+
+        from slot_audit.assessment import Gate, InstrumentAssessment
+
+        gates = tuple(
+            Gate(
+                gate_id=name,
+                title=name,
+                status=GateStatus.PASS,
+                detail="",
+                mandatory=(name != "per_provider_agreement"),
+            )
+            for name in MANDATORY_GATES
+        )
+
+        with self.assertRaisesRegex(ValueError, "may not be marked advisory"):
+            InstrumentAssessment(gates=gates)
+
     def test_the_mandatory_gate_list_is_the_declared_one(self) -> None:
         self.assertEqual(
             MANDATORY_GATES,
@@ -416,6 +435,7 @@ class SingleAssessmentTests(EpochAuditTestCase):
                 "negative_control_provider_hole",
                 "negative_control_token_truncation",
                 "negative_control_previous_blockhash",
+                "ground_truth_constants_provenance",
                 "ground_truth_provenance_binding",
                 "ground_truth_full_epoch_coverage",
                 "per_provider_agreement",
@@ -462,11 +482,64 @@ class AbsenceConfirmationTests(EpochAuditTestCase):
         self.assertEqual([finding.slot for finding in run.findings], [target])
         self.assertIn("-32007", run.findings[0].inference)
 
-    async def test_a_null_block_answer_confirms_absence(self) -> None:
+    async def test_a_null_block_answer_confirms_absence_only_after_a_second_read(
+        self,
+    ) -> None:
         run, target = await self._run_with_direct_answer(None, "confirmed-null")
 
         self.assertEqual([finding.slot for finding in run.findings], [target])
-        self.assertIn("null block", run.findings[0].inference)
+        finding = run.findings[0]
+        self.assertIn("null block", finding.inference)
+        self.assertIn("second independent read agreed", finding.inference)
+        self.assertIn("direct_response_confirmation", finding.evidence)
+        self.assertTrue(
+            (run.evidence_root / finding.evidence["direct_response_confirmation"]
+             .relative_path).is_file()
+        )
+
+    async def test_a_single_unreplicated_null_is_not_enough(self) -> None:
+        """An edge-cache miss returns null once; it must not become a finding."""
+
+        from tests.epoch_support import Handler
+
+        epoch = build_simulated_epoch()
+        target = epoch.produced_slots[5]
+        header = epoch.headers[target]
+        seen = {"n": 0}
+
+        def flaky(handler: Handler) -> Handler:
+            def wrapped(url: str, method: str, params: list) -> object:
+                if method == "getBlock" and int(params[0]) == target:
+                    seen["n"] += 1
+                    # Null for the hash-link read and the first direct read; the
+                    # confirming re-read finds the block the provider had all along.
+                    if seen["n"] < 3:
+                        return None
+                    return {
+                        "blockhash": header.blockhash,
+                        "previousBlockhash": header.previous_blockhash,
+                        "parentSlot": header.parent_slot,
+                    }
+                return handler(url, method, params)
+
+            return wrapped
+
+        run = await run_audit(
+            directory=self.tmp_path / "flaky-null",
+            epoch=epoch,
+            defects={"control-a": LedgerDefects(dropped_slots=frozenset({target}))},
+            handler_wrappers={"control-a": flaky},
+            chunk_size=epoch.spec.scheduled_slot_positions,
+        )
+
+        self.assertEqual(run.findings, ())
+        matter = next(
+            item
+            for item in run.indeterminate
+            if item.slot == target and item.subject.startswith("provider_hole:")
+        )
+        self.assertIn("did not agree", matter.reason)
+        self.assertIn("unreplicated null", matter.reason)
 
     async def test_an_unhealthy_node_never_becomes_a_hole(self) -> None:
         from slot_audit.transport import ScriptedRpcError
@@ -563,6 +636,139 @@ class AbsenceConfirmationTests(EpochAuditTestCase):
         self.assertIn("contradicting the batch omission", matter.reason)
 
 
+class ConclusiveFindingRunTests(EpochAuditTestCase):
+    """The one path the whole instrument exists for, end to end.
+
+    Every other test either produces no findings, or produces findings on a run
+    that is blocked from concluding. Until this test existed, the case the tool
+    is actually built to handle -- every mandatory gate passes *and* a defensible
+    PROVIDER_HOLE is reported -- had never been exercised.
+
+    A 512-position fixture is used so that one lost block leaves agreement at
+    511/512, above the configured 0.99 minimum. On the 32-slot fixture a single
+    finding drags agreement to 96.875% and the run is correctly refused, which is
+    why the case was previously unreachable.
+    """
+
+    async def asyncSetUp(self) -> None:
+        from slot_audit.config import ContinuityConfig
+        from slot_audit.negative_controls import run_all_negative_controls
+
+        self.controls = await run_all_negative_controls(
+            results_dir=self.tmp_path / "controls"
+        )
+        self.epoch = build_simulated_epoch(
+            epoch=900_400, first_slot=410_000_000, positions=512, produced=384
+        )
+        self.target = self.epoch.produced_slots[100]
+        config = build_control_config(self.epoch)
+        self.config = config.model_copy(
+            update={
+                "continuity": ContinuityConfig(
+                    hash_link_validation_population="findings_and_adjacent"
+                )
+            }
+        )
+        self.directory = self.tmp_path / "conclusive"
+        self.run = await run_audit(
+            directory=self.directory,
+            epoch=self.epoch,
+            config=self.config,
+            defects={
+                "control-a": LedgerDefects(dropped_slots=frozenset({self.target}))
+            },
+            negative_controls=self.controls,
+        )
+
+    async def test_the_run_concludes_with_a_finding(self) -> None:
+        self.assertIs(self.run.assessment.status, GateStatus.PASS)
+        self.assertIs(self.run.conclusion.result, RunResult.FINDINGS)
+        self.assertEqual(self.run.conclusion.blocked_by, ())
+        self.assertEqual(len(self.run.findings), 1)
+
+    async def test_every_mandatory_gate_passed(self) -> None:
+        for gate_id in MANDATORY_GATES:
+            with self.subTest(gate=gate_id):
+                gate = self.run.assessment.gate(gate_id)
+                self.assertTrue(gate.mandatory)
+                self.assertIs(gate.status, GateStatus.PASS, gate.detail)
+
+    async def test_the_finding_is_fully_defensible(self) -> None:
+        finding = self.run.findings[0]
+        header = self.epoch.headers[self.target]
+
+        self.assertEqual(finding.slot, self.target)
+        self.assertEqual(finding.provider, "control-a")
+        self.assertIs(finding.verdict, Verdict.PROVIDER_HOLE)
+        self.assertEqual(finding.blockhash, header.blockhash)
+        self.assertEqual(finding.previous_blockhash, header.previous_blockhash)
+        self.assertEqual(finding.parent_slot, header.parent_slot)
+        self.assertEqual(finding.corroborating_providers, ("control-b",))
+        self.assertTrue(finding.complete)
+
+    async def test_agreement_survives_a_single_lost_block(self) -> None:
+        agreement = next(
+            item for item in self.run.provider_agreements if item.provider == "control-a"
+        )
+
+        self.assertEqual(
+            agreement.classification_rate, Fraction(511, 512)
+        )
+        self.assertGreater(agreement.classification_rate, Fraction(99, 100))
+
+    async def test_summary_result_and_sealed_evidence_all_agree(self) -> None:
+        from slot_audit.report import verify_reports
+
+        summary_path, result_path = write_reports(
+            self.run, results_dir=self.directory
+        )
+        summary = summary_path.read_text(encoding="utf-8")
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+
+        self.assertIn("**Result:** `FINDINGS`", summary)
+        self.assertIn("**Instrument validation status:** `PASS`", summary)
+        self.assertIn(str(self.target), summary)
+        self.assertEqual(result["conclusion"]["result"], "FINDINGS")
+        self.assertEqual(result["findings"][0]["slot"], self.target)
+        self.assertEqual(result["assessment"]["status"], "PASS")
+
+        # The readable copies are the sealed bytes, and the store is intact.
+        self.assertTrue(verify_manifest(self.run.evidence_root).ok)
+        self.assertEqual(verify_reports(self.directory, self.run.evidence_root), [])
+        self.assertIsNotNone(self.run.summary_evidence)
+        self.assertIsNotNone(self.run.result_evidence)
+
+    async def test_the_conclusion_is_reachable_only_because_the_gates_passed(
+        self,
+    ) -> None:
+        """The same run without its controls must refuse to conclude."""
+
+        rerun = await run_audit(
+            directory=self.tmp_path / "uncontrolled",
+            epoch=self.epoch,
+            config=self.config,
+            defects={
+                "control-a": LedgerDefects(dropped_slots=frozenset({self.target}))
+            },
+            run_negative_controls=False,
+        )
+
+        self.assertEqual(len(rerun.findings), 1)
+        self.assertIs(rerun.conclusion.result, RunResult.NO_CONCLUSION)
+
+
+class VacuousChainTests(EpochAuditTestCase):
+    async def test_a_chain_with_nothing_to_check_does_not_claim_success(self) -> None:
+        from slot_audit.continuity import ContinuityResult
+
+        empty = ContinuityResult(population="nothing", population_size=0, links=())
+
+        self.assertTrue(empty.vacuous)
+        self.assertFalse(empty.clean)
+        self.assertIn("vacuous", empty.to_payload())
+        self.assertTrue(empty.to_payload()["vacuous"])
+
+
 class RequestCostTests(EpochAuditTestCase):
     async def test_request_cost_is_recorded_per_provider_and_reported(self) -> None:
         directory = self.tmp_path / "run"
@@ -629,6 +835,51 @@ class RequestCostTests(EpochAuditTestCase):
 
 
 class AgreementReportingTests(EpochAuditTestCase):
+    async def test_agreement_is_reported_once_not_as_two_lookalike_metrics(self) -> None:
+        """Two figures that are always equal are one measurement, not two."""
+
+        run = await run_audit(directory=self.tmp_path / "run")
+        payload = run.to_payload()["agreement"]["per_provider"][0]
+
+        self.assertNotIn("availability_agreement", payload)
+        self.assertIn("classification_agreement", payload)
+        self.assertIn("coverage_completeness", payload)
+        self.assertIn("counted twice", payload["note"])
+        # Coverage is scored over every scheduled position and never over the
+        # agreement denominator, so the two cannot collapse into each other.
+        self.assertEqual(
+            payload["coverage_completeness"]["denominator"],
+            run.spec.scheduled_slot_positions,
+        )
+
+    async def test_coverage_and_agreement_diverge_when_a_provider_cannot_answer(
+        self,
+    ) -> None:
+        from tests.epoch_support import failing_get_blocks
+
+        epoch = build_simulated_epoch()
+        run = await run_audit(
+            directory=self.tmp_path / "partial",
+            epoch=epoch,
+            chunk_size=1,
+            handler_wrappers={"control-a": failing_get_blocks(epoch.produced_slots[4])},
+        )
+        agreement = next(
+            item for item in run.provider_agreements if item.provider == "control-a"
+        )
+
+        # Perfect agreement over what it answered for, but incomplete coverage.
+        # A single number could not express both.
+        self.assertEqual(agreement.classification_rate, Fraction(1, 1))
+        self.assertEqual(
+            agreement.coverage_rate,
+            Fraction(
+                epoch.spec.scheduled_slot_positions - 1,
+                epoch.spec.scheduled_slot_positions,
+            ),
+        )
+        self.assertNotEqual(agreement.classification_rate, agreement.coverage_rate)
+
     async def test_per_provider_and_combined_agreement_are_reported_separately(
         self,
     ) -> None:
@@ -670,7 +921,7 @@ class AgreementReportingTests(EpochAuditTestCase):
 
         for item in payload["per_provider"]:
             with self.subTest(provider=item["provider"]):
-                for section in ("classification_agreement", "availability_agreement"):
+                for section in ("classification_agreement", "coverage_completeness"):
                     block = item[section]
                     self.assertIn("numerator", block)
                     self.assertIn("denominator", block)
@@ -806,7 +1057,7 @@ def _empty_tally(positions: int):
         candidate_holes=(),
         conflicts=(),
         indeterminate_outcomes=(),
-        provider_availability={},
+        provider_coverage={},
         provider_classification={},
         combined_agreement=(0, 0),
     )

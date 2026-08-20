@@ -9,6 +9,12 @@ class Verdict(StrEnum):
     PROVIDER_HOLE = "PROVIDER_HOLE"
     BEFORE_RETENTION = "BEFORE_RETENTION"
     INDETERMINATE = "INDETERMINATE"
+    #: One provider omitted a slot another provider returned, and nothing has
+    #: confirmed *why*. It is a discrepancy worth investigating, not a finding.
+    #: Silent response truncation by a gateway produces exactly this signature,
+    #: so promoting it to PROVIDER_HOLE without a direct, semantically explicit
+    #: denial from the provider would be asserting more than was observed.
+    UNCONFIRMED_OMISSION = "UNCONFIRMED_OMISSION"
     #: The provider served a block at a position the anchor calls skipped.
     #: Never a hole and never a skip: something is wrong with one of the two,
     #: and the audit must say so rather than pick a winner.

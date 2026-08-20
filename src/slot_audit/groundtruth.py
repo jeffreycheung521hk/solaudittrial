@@ -17,9 +17,14 @@ Trust chain
 3. Records are produced by a pinned extractor whose identity is retained.  The
    derived record file is written into evidence with its own SHA-256 and byte
    length, so the derivation is re-performable without the archive.
-4. Coverage is asserted against the published epoch constants: the predecessor
+4. Coverage is asserted against the declared epoch constants: the predecessor
    boundary row is filtered *explicitly* and counted, and the number of in-range
-   produced blocks must equal the published figure exactly.
+   produced blocks must equal the declared figure exactly.
+
+Step 1 is only as strong as the provenance of the pinned values themselves. See
+:class:`ConstantProvenance`: a specification whose constants are not traceable to
+an authority fails the mandatory ``ground_truth_constants_provenance`` gate, and
+the run concludes nothing.
 
 Any failed step leaves the anchor unverified, and an unverified anchor is not
 allowed to produce a conclusive classification.
@@ -55,8 +60,42 @@ class GroundTruthError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ConstantProvenance:
+    """Where the pinned constants came from, and whether anyone checked them.
+
+    This matters more than it looks. The anchor's strength rests entirely on the
+    pinned digest: "the archive hashes to the pinned value" only means something
+    if the pinned value itself traces to an authority. If it does not, the check
+    degrades to "the archive matches a number somebody typed", and an operator
+    whose real file disagrees has no move except to edit the constant -- at which
+    point the anchor is whatever file they already had.
+
+    So provenance is recorded, and an unverified constant blocks the run.
+    """
+
+    source: str
+    verified_against_archive: bool
+    note: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "source": self.source,
+            "verified_against_archive": self.verified_against_archive,
+            "note": self.note,
+        }
+
+
+#: The safe default. A spec that does not state its provenance is unverified.
+UNVERIFIED_PROVENANCE = ConstantProvenance(
+    source="unstated",
+    verified_against_archive=False,
+    note="no provenance was recorded for these constants",
+)
+
+
+@dataclass(frozen=True, slots=True)
 class EpochGroundTruthSpec:
-    """Published, in-source constants for one complete epoch."""
+    """In-source constants for one complete epoch, with their provenance."""
 
     epoch: int
     first_slot: int
@@ -69,6 +108,7 @@ class EpochGroundTruthSpec:
     car_root_cid: str
     car_sha256: str
     source_commit: str
+    provenance: ConstantProvenance = UNVERIFIED_PROVENANCE
 
     def __post_init__(self) -> None:
         if self.last_slot < self.first_slot:
@@ -107,6 +147,7 @@ class EpochGroundTruthSpec:
             "car_root_cid": self.car_root_cid,
             "car_sha256": self.car_sha256,
             "source_commit": self.source_commit,
+            "provenance": self.provenance.to_payload(),
         }
 
 
@@ -122,6 +163,24 @@ EPOCH_100_GROUND_TRUTH = EpochGroundTruthSpec(
     car_root_cid="bafyreibqt2nvroysxlxctgb52xxn27ectsllv2xyka4qar7ga6vupmbs3i",
     car_sha256="9f6d631833a8dfe0a4253ceede8e4af18a63603f0131a71ca5e947ba77eaec5a",
     source_commit="a69a0d2e189006608e3b73b7659a957b00b3567e",
+    provenance=ConstantProvenance(
+        source=(
+            "supplied verbatim by the specification that commissioned this tool; "
+            "no citation to an Old Faithful release, index or announcement was "
+            "provided with them"
+        ),
+        verified_against_archive=False,
+        note=(
+            "NOT INDEPENDENTLY VERIFIED. Nobody working on this repository has "
+            "held the epoch-100 archive, so the SHA-256 above cannot have been "
+            "measured here, and the block and slot counts have not been checked "
+            "against any authority. Until someone reconciles these values with a "
+            "published Old Faithful source and sets verified_against_archive, the "
+            "anchor is not defensible and the run is blocked from concluding. "
+            "Editing these constants to match a file you already hold does not "
+            "resolve this -- it inverts the check."
+        ),
+    ),
 )
 
 #: Epochs this build is allowed to anchor against, keyed by epoch number.
@@ -836,8 +895,10 @@ __all__ = [
     "BLOCK_NODE_SCHEMA",
     "EPOCH_100_GROUND_TRUTH",
     "PINNED_EPOCH_GROUND_TRUTH",
+    "UNVERIFIED_PROVENANCE",
     "CarBlockHeaderExtractor",
     "CarCensus",
+    "ConstantProvenance",
     "EpochGroundTruthSpec",
     "ExtractorIdentity",
     "GroundTruth",

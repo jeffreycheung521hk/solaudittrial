@@ -175,8 +175,18 @@ class ContinuityResult:
         return tuple(sorted({link.outcome.value for link in self.links}))
 
     @property
+    def vacuous(self) -> bool:
+        """True when nothing was actually validated.
+
+        Reporting "all validated links matched" after checking zero links is
+        technically true and practically a lie, so callers distinguish the case.
+        """
+
+        return not self.links
+
+    @property
     def clean(self) -> bool:
-        return all(link.ok for link in self.links)
+        return bool(self.links) and all(link.ok for link in self.links)
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -187,6 +197,7 @@ class ContinuityResult:
             "parent_slot_mismatches": len(self.parent_slot_mismatches),
             "indeterminate": len(self.indeterminate),
             "outcomes": list(self.outcomes),
+            "vacuous": self.vacuous,
             "failed_links": [
                 link.to_payload() for link in self.links if not link.ok
             ],

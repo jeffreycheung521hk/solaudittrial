@@ -13,6 +13,8 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
+from fractions import Fraction
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
@@ -43,7 +45,10 @@ from .rpc import RetryEvent, RpcClient
 EXIT_COMPLETE = 0
 EXIT_PARTIAL = 1
 EXIT_FAILED = 2
-INDETERMINATE_TRUST_THRESHOLD = 0.01
+# Exact, like every other judgment threshold in this tool. A float literal here
+# would mean the shipped package decides "trustworthy" by binary comparison in
+# one code path while insisting on Decimal in the other.
+INDETERMINATE_TRUST_THRESHOLD = Decimal("0.01")
 
 
 class _EnumerationRpcClient(Protocol):
@@ -210,11 +215,16 @@ def _stream_cross_provider_rows(
                     "slot": finding.slot,
                     "epoch": epoch,
                     "verdict": finding.verdict.value,
+                    # Top level, not buried in evidence: a reader scanning rows
+                    # must not be able to miss that nothing was confirmed.
+                    "confirmed": False,
+                    "conclusive": False,
                     "error_code": None,
                     "error_message": None,
                     "evidence": {
                         "evidence_method": "cross_provider_presence",
                         "hash_verified": False,
+                        "direct_getblock_issued": False,
                         **finding.evidence,
                     },
                     "checked_at": checked_at,
@@ -715,24 +725,33 @@ async def run_enumeration(
             f"{incomplete_eligible} tip-safe provider(s) did not complete trustworthy "
             "enumeration."
         )
+    if hole_count:
+        limitations.append(
+            f"{hole_count} cross-provider omission(s) were observed. Pass A issues no "
+            "direct getBlock and obtains no explicit denial, so none of them is a "
+            "confirmed provider data hole; silent response truncation by a gateway "
+            "produces an identical signature. Confirm with the single-epoch audit "
+            "before attributing data loss to any provider."
+        )
     if epoch_schedule is None and hole_count:
         limitations.append(
             "Epoch attribution is unavailable because no valid epoch schedule was returned; "
             "hole evidence is retained with epoch set to null."
         )
-    indeterminate_rates: dict[str, float] = {}
+    indeterminate_rates: dict[str, Fraction] = {}
     for result in ordered_enumerations:
         in_retention_scope = result.audited_slot_count + result.failed_slot_count
         rate = (
-            result.failed_slot_count / in_retention_scope
+            Fraction(result.failed_slot_count, in_retention_scope)
             if in_retention_scope
-            else 0.0
+            else Fraction(0)
         )
         indeterminate_rates[result.provider] = rate
-        if rate > INDETERMINATE_TRUST_THRESHOLD:
+        if rate > Fraction(INDETERMINATE_TRUST_THRESHOLD):
             limitations.append(
                 f"{result.provider} has {result.failed_slot_count} INDETERMINATE slots "
-                f"({rate:.2%} of its in-retention range), exceeding the 1% threshold; "
+                f"({rate.numerator}/{rate.denominator} of its in-retention range), "
+                f"exceeding the {INDETERMINATE_TRUST_THRESHOLD} threshold; "
                 "this run is not trustworthy."
             )
     if usable and not _has_overlapping_successful_coverage(ordered_enumerations):
@@ -758,7 +777,7 @@ async def run_enumeration(
         status = "complete"
         exit_code = EXIT_COMPLETE
     trustworthy = status == "complete" and all(
-        rate <= INDETERMINATE_TRUST_THRESHOLD
+        rate <= Fraction(INDETERMINATE_TRUST_THRESHOLD)
         for rate in indeterminate_rates.values()
     )
 
@@ -773,7 +792,7 @@ async def run_enumeration(
             "total_requests": total_requests,
             "requests_this_invocation": clients[provider.name].request_count,
             "remaining_request_budget": max(0, max_requests - total_requests),
-            "cross_provider_holes": holes_by_provider[provider.name],
+            "unconfirmed_omissions": holes_by_provider[provider.name],
             "observed_finalized_tip": observed_tips.get(provider.name),
             "tip_safe_for_range": provider.name in eligible_provider_names,
         }
@@ -788,10 +807,14 @@ async def run_enumeration(
                     "candidate_gaps": result.candidate_gap_count,
                     "before_retention": result.before_retention_slot_count,
                     "indeterminate": result.failed_slot_count,
-                    "indeterminate_rate": indeterminate_rates[result.provider],
+                    "indeterminate_rate": float(indeterminate_rates[result.provider]),
+                    "indeterminate_rate_exact": (
+                        f"{indeterminate_rates[result.provider].numerator}/"
+                        f"{indeterminate_rates[result.provider].denominator}"
+                    ),
                     "indeterminate_exceeds_threshold": (
                         indeterminate_rates[result.provider]
-                        > INDETERMINATE_TRUST_THRESHOLD
+                        > Fraction(INDETERMINATE_TRUST_THRESHOLD)
                     ),
                     "failed_chunks": [
                         {
@@ -811,7 +834,7 @@ async def run_enumeration(
         "pass": "A",
         "status": status,
         "trustworthy": trustworthy,
-        "indeterminate_trust_threshold": INDETERMINATE_TRUST_THRESHOLD,
+        "indeterminate_trust_threshold": str(INDETERMINATE_TRUST_THRESHOLD),
         "run_id": run_id,
         "started_at": run_started_at,
         "completed_at": checked_at,
@@ -836,7 +859,7 @@ async def run_enumeration(
         "requests_this_invocation": sum(
             client.request_count for client in clients.values()
         ),
-        "cross_provider_holes": hole_count,
+        "unconfirmed_omissions": hole_count,
         "partial_errors": [
             issue.to_payload()
             for issue in sorted(issues, key=_issue_sort_key)
@@ -859,7 +882,7 @@ async def run_enumeration(
         "enumeration_completed",
         status=status,
         exit_code=exit_code,
-        cross_provider_holes=hole_count,
+        unconfirmed_omissions=hole_count,
         total_requests=summary_payload["total_requests"],
     )
     return exit_code
@@ -1003,6 +1026,15 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="the evidence directory containing manifest.json",
     )
+    verify_parser.add_argument(
+        "--results-dir",
+        default=None,
+        help=(
+            "also compare summary.md and result.json in this directory against the "
+            "sealed copies inside the evidence store (defaults to the evidence "
+            "directory's parent)"
+        ),
+    )
     return parser
 
 
@@ -1069,12 +1101,21 @@ def probe_car_command(car: str, *, max_blocks: int | None, as_json: bool) -> int
     return EXIT_COMPLETE if census.schema_present else EXIT_PARTIAL
 
 
-def verify_evidence_command(evidence_dir: str) -> int:
+def verify_evidence_command(evidence_dir: str, results_dir: str | None = None) -> int:
     from .evidence import verify_manifest
+    from .report import verify_reports
 
     verification = verify_manifest(evidence_dir)
     print(verification.describe())
-    return EXIT_COMPLETE if verification.ok else EXIT_FAILED
+
+    reports_dir = Path(results_dir) if results_dir else Path(evidence_dir).parent
+    problems = verify_reports(reports_dir, evidence_dir)
+    if problems:
+        for problem in problems:
+            print(f"report verification failed: {problem}")
+    else:
+        print("readable reports match their sealed copies")
+    return EXIT_COMPLETE if verification.ok and not problems else EXIT_FAILED
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1083,7 +1124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .evidence import EvidenceError
 
         try:
-            return verify_evidence_command(args.evidence_dir)
+            return verify_evidence_command(args.evidence_dir, args.results_dir)
         except EvidenceError as exc:
             print(f"error: {exc}")
             return EXIT_FAILED

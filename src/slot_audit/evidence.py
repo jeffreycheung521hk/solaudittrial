@@ -13,6 +13,14 @@ Three properties are load-bearing for audit use:
 * **Closed-world verification.** :meth:`EvidenceStore.verify` reports missing,
   modified *and* unexpected unmanifested files.  An artifact that nobody
   declared is a finding, not a curiosity.
+
+  The manifest is **not signed**, and without a key it cannot be. It detects
+  accidental corruption, partial loss and naive editing -- someone who changes a
+  retained response but not the manifest. It does **not** detect an editor who
+  also recomputes the affected digest and rewrites the manifest, and the same
+  applies to ``write_order``, which is ordinary JSON inside that manifest. The
+  guarantee is integrity against damage and casual tampering, not authenticity
+  against a motivated forger with write access to the directory.
 * **Append-only runs.** A store refuses to open on a directory that already
   holds evidence, so a re-run can never quietly overwrite the record it is
   supposed to be checked against.
@@ -55,9 +63,9 @@ def sha256_hex(data: bytes) -> str:
 def sha256_file(path: str | Path, *, chunk_bytes: int = STREAM_CHUNK_BYTES) -> str:
     """Digest a file without loading it.
 
-    The published epoch-100 archive is 62.9 GB. Reading it into memory to hash
-    it would put the anchor out of reach of the machines most likely to be
-    checking it, so every read path here is incremental.
+    The epoch-100 archive is reported to be 62.9 GB. Reading a file that size
+    into memory would put the anchor out of reach of the machines most likely to
+    be checking it, so every read path here is incremental.
     """
 
     digest = hashlib.sha256()
@@ -181,7 +189,11 @@ class ManifestVerification:
 
     def describe(self) -> str:
         if self.ok:
-            return "manifest verified: no missing, modified or unexpected files"
+            return (
+                "manifest verified: no missing, modified or unexpected files "
+                "(unsigned: this rules out damage and naive edits, not a forger "
+                "who also rewrote the manifest)"
+            )
         parts = []
         if self.missing:
             parts.append(f"missing={list(self.missing)}")
@@ -471,7 +483,12 @@ class EvidenceStore:
 
 
 def verify_manifest(root: str | Path) -> ManifestVerification:
-    """Compare a manifest against the directory in both directions."""
+    """Compare a manifest against the directory in both directions.
+
+    Unsigned, so this establishes that the directory is internally consistent
+    with its own manifest -- not that either is authentic. See the module
+    docstring for what that does and does not rule out.
+    """
 
     base = Path(root)
     manifest_path = base / MANIFEST_NAME

@@ -133,12 +133,16 @@ class EnumerationTests(unittest.IsolatedAsyncioTestCase):
             [("alpha", 102), ("alpha", 110)],
         )
         self.assertEqual(findings[0].corroborating_providers, ("bravo", "charlie"))
-        self.assertIs(findings[0].verdict, Verdict.PROVIDER_HOLE)
+        self.assertIs(findings[0].verdict, Verdict.UNCONFIRMED_OMISSION)
+        self.assertFalse(findings[0].confirmed)
         self.assertEqual(
             findings[0].evidence["corroborating_providers"], ["bravo", "charlie"]
         )
         self.assertIn("successfully enumerated", findings[0].reasoning)
-        self.assertIn("proving that the block existed", findings[0].reasoning)
+        self.assertIn("has NOT", findings[0].reasoning)
+        self.assertIn("silent response truncation", findings[0].reasoning)
+        self.assertNotIn("proving", findings[0].reasoning)
+        self.assertTrue(findings[0].evidence["unexcluded_explanations"])
 
         # Alpha's failed 104-107 call cannot produce four false findings, despite
         # both peers returning those blocks. Charlie's 100-101 retention region is

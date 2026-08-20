@@ -138,6 +138,8 @@ class ClosedWorldManifestTests(EvidenceTestCase):
         self.assertEqual(verification.modified, ())
         self.assertEqual(verification.unexpected, ())
         self.assertIn("no missing, modified or unexpected", verification.describe())
+        # The claim must be stated with its limit, not absolutely.
+        self.assertIn("unsigned", verification.describe())
 
     def test_tampering_with_a_retained_response_is_detected(self) -> None:
         store = self._finalized_store()
@@ -197,6 +199,35 @@ class ClosedWorldManifestTests(EvidenceTestCase):
         self.assertEqual(verification.missing, ("artifacts/scope.json",))
         self.assertEqual(verification.modified, (raw.relative_to(store.root).as_posix(),))
         self.assertEqual(verification.unexpected, ("extra.json",))
+
+    def test_a_recomputed_manifest_is_not_detected_and_this_is_documented(
+        self,
+    ) -> None:
+        """An unsigned manifest cannot defeat someone who rewrites it too."""
+
+        import json as _json
+
+        store = self._finalized_store()
+        target = store.root / "artifacts" / "scope.json"
+        forged = b'{"epoch": 999}\n'
+        target.write_bytes(forged)
+        manifest_path = store.root / MANIFEST_NAME
+        manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        for entry in manifest["entries"]:
+            if entry["relative_path"] == "artifacts/scope.json":
+                entry["sha256"] = sha256_hex(forged)
+                entry["byte_length"] = len(forged)
+        manifest_path.write_text(
+            _json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        # This passes, and that is the honest limit of an unsigned manifest.
+        self.assertTrue(verify_manifest(store.root).ok)
+        # The module says so rather than overclaiming.
+        import slot_audit.evidence as evidence_module
+
+        self.assertIn("not signed", evidence_module.__doc__ or "")
 
     def test_a_missing_manifest_is_an_error_not_a_pass(self) -> None:
         store = self._finalized_store()

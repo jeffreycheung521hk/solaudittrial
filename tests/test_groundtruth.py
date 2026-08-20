@@ -54,7 +54,17 @@ def build_archive(headers: list[GroundTruthHeader], *, epoch: int) -> tuple[byte
 
 
 class PublishedEpoch100Tests(unittest.TestCase):
-    def test_pinned_constants_match_the_published_epoch_100_figures(self) -> None:
+    def test_pinned_constants_are_unchanged(self) -> None:
+        """A change detector, NOT external verification.
+
+        Restating the same literals in a test file proves only that nobody
+        edited them by accident. It cannot establish that they are correct,
+        because there is no authority in this repository to check them against.
+        That gap is what :meth:`test_the_constants_declare_that_nobody_verified_them`
+        asserts is disclosed, and what the mandatory
+        ``ground_truth_constants_provenance`` gate blocks on.
+        """
+
         spec = EPOCH_100_GROUND_TRUTH
 
         self.assertEqual(spec.epoch, 100)
@@ -75,7 +85,37 @@ class PublishedEpoch100Tests(unittest.TestCase):
         )
         self.assertEqual(spec.source_commit, "a69a0d2e189006608e3b73b7659a957b00b3567e")
 
-    def test_the_published_figures_are_internally_consistent(self) -> None:
+    def test_the_constants_declare_that_nobody_verified_them(self) -> None:
+        """The repository must not present unsourced numbers as established."""
+
+        provenance = EPOCH_100_GROUND_TRUTH.provenance
+
+        self.assertFalse(provenance.verified_against_archive)
+        self.assertIn("commissioned this tool", provenance.source)
+        self.assertIn("NOT INDEPENDENTLY VERIFIED", provenance.note)
+        self.assertIn("inverts the check", provenance.note)
+
+    def test_a_specification_without_stated_provenance_is_unverified(self) -> None:
+        from slot_audit.groundtruth import UNVERIFIED_PROVENANCE
+
+        spec = EpochGroundTruthSpec(
+            epoch=7,
+            first_slot=100,
+            last_slot=131,
+            scheduled_slot_positions=32,
+            produced_blocks=30,
+            skipped_slots=2,
+            predecessor_boundary_slot=99,
+            slots_file_name="7.slots.txt",
+            car_root_cid=EPOCH_100_GROUND_TRUTH.car_root_cid,
+            car_sha256=EPOCH_100_GROUND_TRUTH.car_sha256,
+            source_commit=EPOCH_100_GROUND_TRUTH.source_commit,
+        )
+
+        self.assertIs(spec.provenance, UNVERIFIED_PROVENANCE)
+        self.assertFalse(spec.provenance.verified_against_archive)
+
+    def test_the_declared_figures_are_internally_consistent(self) -> None:
         spec = EPOCH_100_GROUND_TRUTH
 
         self.assertEqual(spec.produced_blocks + spec.skipped_slots, 432_000)

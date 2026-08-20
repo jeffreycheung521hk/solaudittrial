@@ -191,6 +191,11 @@ async def collect_provider(
         succeeded = not call.failed and isinstance(call.result, list)
         count = 0
         error = call.error_message
+        # Accumulate into a scratch set. A batch that fails validation half-way
+        # through must contribute nothing, or the slots read before the failure
+        # would survive into the frozen inference artifact while the range itself
+        # is excluded from coverage -- an internally inconsistent record.
+        batch_present: set[int] = set()
         if succeeded:
             for slot in call.result:
                 if isinstance(slot, bool) or not isinstance(slot, int):
@@ -198,7 +203,7 @@ async def collect_provider(
                     error = "getBlocks returned a non-integer slot"
                     break
                 if start <= slot <= end:
-                    present.add(slot)
+                    batch_present.add(slot)
                     count += 1
                 else:
                     succeeded = False
@@ -206,7 +211,10 @@ async def collect_provider(
                     break
         elif error is None:
             error = "getBlocks did not return a list"
-        if not succeeded:
+        if succeeded:
+            present |= batch_present
+        else:
+            count = 0
             errors.append(f"{start}-{end}: {error}")
         ranges.append(
             RangeResponse(
@@ -336,7 +344,7 @@ class ClassificationTally:
     candidate_holes: tuple[SlotOutcome, ...]
     conflicts: tuple[SlotOutcome, ...]
     indeterminate_outcomes: tuple[SlotOutcome, ...]
-    provider_availability: Mapping[str, tuple[int, int]]
+    provider_coverage: Mapping[str, int]
     provider_classification: Mapping[str, tuple[int, int]]
     combined_agreement: tuple[int, int]
 
@@ -376,8 +384,7 @@ def classify_epoch(
         name: {verdict.value: 0 for verdict in Verdict} for name in names
     }
     inference_counts = {value.value: 0 for value in ExistenceInference}
-    availability_hits = {name: 0 for name in names}
-    availability_total = {name: 0 for name in names}
+    covered_positions = {name: 0 for name in names}
     classification_hits = {name: 0 for name in names}
     classification_total = {name: 0 for name in names}
     combined_hits = 0
@@ -437,21 +444,18 @@ def classify_epoch(
             if verdict is Verdict.INDETERMINATE:
                 position_indeterminate = True
 
-            # Availability agreement is scored over the provider's own successful
-            # coverage; classification agreement is scored over the audit
-            # population.  Keeping the denominators distinct is the point.
-            if state is not ProviderSlotState.UNCOVERED and truth is not GroundTruthState.UNKNOWN:
-                availability_total[name] += 1
-                if (state is ProviderSlotState.PRESENT) == (
-                    truth is GroundTruthState.PRODUCED
-                ):
-                    availability_hits[name] += 1
-            elif count_all:
-                availability_total[name] += 1
+            # Coverage is about this provider alone: did it successfully answer
+            # for this position at all? It has no dependence on the anchor, which
+            # is what makes it a different measurement from agreement rather than
+            # the same one relabelled.
+            if state is not ProviderSlotState.UNCOVERED:
+                covered_positions[name] += 1
 
             # A provider on its own can only infer "present" or "missing, so
             # presumably skipped".  Classification agreement measures how often
-            # that unaided inference matches the anchored label.
+            # that unaided inference matches the anchored label. This is the only
+            # agreement figure; see ProviderAgreement for why there is not a
+            # second one.
             if verdict is not Verdict.INDETERMINATE:
                 classification_total[name] += 1
                 naive = (
@@ -501,9 +505,7 @@ def classify_epoch(
         candidate_holes=tuple(candidate_holes),
         conflicts=tuple(conflicts),
         indeterminate_outcomes=tuple(indeterminate_outcomes),
-        provider_availability={
-            name: (availability_hits[name], availability_total[name]) for name in names
-        },
+        provider_coverage=dict(covered_positions),
         provider_classification={
             name: (classification_hits[name], classification_total[name]) for name in names
         },
@@ -531,7 +533,15 @@ SLOT_ABSENT_RPC_CODES = frozenset({-32007, -32009})
 BELOW_RETENTION_RPC_CODE = -32001
 
 
-def confirms_absence(call: RecordedCall) -> tuple[bool, str]:
+#: A bare ``null`` is a *successful* response, so the transport never retries it.
+#: Solana defines it as "block not confirmed", but gateway layers have been known
+#: to return it for an edge-cache miss on a slot they do hold. One unretried read
+#: is therefore not enough to found a conclusive finding on, and a second
+#: independent read is required before a null is accepted as a denial.
+NULL_CONFIRMATION_READS = 2
+
+
+def confirms_absence(call: RecordedCall) -> tuple[bool, str, str | None]:
     """Does this direct answer actually assert that no block exists?
 
     A failure caused by *us* -- an exhausted request budget, a transport fault, a
@@ -542,26 +552,34 @@ def confirms_absence(call: RecordedCall) -> tuple[bool, str]:
     """
 
     if not call.failed and call.result is None:
-        return True, "the provider returned a null block for this slot"
+        return True, "the provider returned a null block for this slot", "null"
     if call.error_code in SLOT_ABSENT_RPC_CODES:
-        return True, (
+        return (
+            True,
             f"the provider answered {call.error_code} "
-            f"({call.error_message}) for this slot"
+            f"({call.error_message}) for this slot",
+            "explicit_denial",
         )
     if call.error_code == BELOW_RETENTION_RPC_CODE:
-        return False, (
+        return (
+            False,
             "the provider reports the slot is below its retention boundary "
             f"({call.error_message}); that is a retention limitation, not a "
-            "demonstrated data hole"
+            "demonstrated data hole",
+            None,
         )
     if call.failed:
-        return False, (
+        return (
+            False,
             f"the direct getBlock did not produce a usable answer "
             f"({call.error_message}) after {call.attempts} attempt(s); this run "
-            "could not establish that the provider lacks the block"
+            "could not establish that the provider lacks the block",
+            None,
         )
-    return False, (
-        "the direct getBlock returned a block, contradicting the batch omission"
+    return (
+        False,
+        "the direct getBlock returned a block, contradicting the batch omission",
+        None,
     )
 
 
@@ -707,6 +725,8 @@ class AuditRun:
     provenance: ToolProvenance
     evidence_root: Path
     manifest: EvidenceRef | None = None
+    summary_evidence: EvidenceRef | None = None
+    result_evidence: EvidenceRef | None = None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -734,6 +754,16 @@ class AuditRun:
             "request_stats": [item.to_payload() for item in self.request_stats],
             "assessment": self.assessment.to_payload(),
             "manifest": None if self.manifest is None else self.manifest.to_payload(),
+            "sealed_reports": {
+                "summary": (
+                    None if self.summary_evidence is None
+                    else self.summary_evidence.to_payload()
+                ),
+                "result": (
+                    None if self.result_evidence is None
+                    else self.result_evidence.to_payload()
+                ),
+            },
         }
 
 
@@ -1092,10 +1122,8 @@ async def run_epoch_audit(
     )
     evidence.record_json_artifact("assessment.json", assessment.to_payload())
     evidence.record_json_artifact("conclusion.json", conclusion.to_payload())
-    completed = provenance.completed(now())
-    manifest = evidence.finalize(provenance=completed)
 
-    return AuditRun(
+    draft = AuditRun(
         scope=scope_payload,
         spec=chosen_spec,
         ground_truth=ground_truth,
@@ -1112,9 +1140,29 @@ async def run_epoch_audit(
         request_stats=request_stats,
         assessment=assessment,
         conclusion=conclusion,
-        provenance=completed,
+        provenance=provenance,
         evidence_root=evidence.root,
+    )
+
+    # The two documents a human actually reads are sealed inside the manifest,
+    # not left beside it. Rendering them before finalize is what lets the
+    # closed-world check cover the conclusion as well as the raw material.
+    from .report import render_result_bytes, render_summary
+
+    summary_bytes = render_summary(draft, results_dir=results_dir).encode("utf-8")
+    result_bytes = render_result_bytes(draft)
+    summary_ref = evidence.record_artifact("summary.md", summary_bytes)
+    result_ref = evidence.record_artifact("result.json", result_bytes)
+
+    completed = provenance.completed(now())
+    manifest = evidence.finalize(provenance=completed)
+
+    return replace(
+        draft,
+        provenance=completed,
         manifest=manifest,
+        summary_evidence=summary_ref,
+        result_evidence=result_ref,
     )
 
 
@@ -1200,7 +1248,27 @@ async def build_findings(
                 refs["peer_response"] = peer_call.raw_ref
                 break
 
-            confirmed, absence_detail = confirms_absence(direct)
+            confirmed, absence_detail, basis = confirms_absence(direct)
+            if confirmed and basis == "null":
+                # A null is not retried by the transport, so a single one is a
+                # single unreplicated observation. Read again before founding a
+                # conclusive finding on it.
+                second = await clients[provider].get_block(slot)
+                refs["direct_response_confirmation"] = second.raw_ref
+                again, second_detail, second_basis = confirms_absence(second)
+                if not again:
+                    confirmed = False
+                    absence_detail = (
+                        "the first direct read returned null but an independent "
+                        f"confirming read did not agree ({second_detail}); a single "
+                        "unreplicated null is not evidence that the provider lacks "
+                        "the block"
+                    )
+                else:
+                    absence_detail = (
+                        f"{absence_detail}, and a second independent read agreed "
+                        f"({second_basis})"
+                    )
             if not confirmed:
                 indeterminate.append(
                     IndeterminateMatter(
@@ -1341,15 +1409,14 @@ def _build_agreements(
     for collection in collections:
         name = collection.provider
         classification_hits, classification_total = tally.provider_classification[name]
-        availability_hits, availability_total = tally.provider_availability[name]
         indeterminate = tally.verdict_counts[name][Verdict.INDETERMINATE.value]
         agreements.append(
             ProviderAgreement(
                 provider=name,
                 classification_numerator=classification_hits,
                 classification_denominator=classification_total,
-                availability_numerator=availability_hits,
-                availability_denominator=availability_total,
+                covered_positions=tally.provider_coverage[name],
+                scheduled_positions=tally.scheduled_positions,
                 indeterminate_count=indeterminate,
                 denominator_policy=denominator_policy,
             )
@@ -1428,6 +1495,26 @@ def build_assessment(
                 )
             )
 
+    constants = spec.provenance
+    gates.append(
+        build_gate(
+            "ground_truth_constants_provenance",
+            "The pinned constants trace to an authority",
+            passed=constants.verified_against_archive,
+            detail=(
+                f"source: {constants.source}. {constants.note}"
+                if not constants.verified_against_archive
+                else f"verified; source: {constants.source}"
+            ),
+            metrics={
+                "source": constants.source,
+                "verified_against_archive": str(constants.verified_against_archive),
+                "car_sha256": spec.car_sha256,
+                "produced_blocks": str(spec.produced_blocks),
+            },
+        )
+    )
+
     binding_failures = [f"{step.step}: {step.detail}" for step in ground_truth.failures]
     gates.append(
         build_gate(
@@ -1486,7 +1573,6 @@ def build_assessment(
     agreement_ok = bool(provider_agreements)
     for agreement in provider_agreements:
         classification = agreement.classification_rate
-        availability = agreement.availability_rate
         agreement_metrics[f"{agreement.provider}.classification_agreement"] = format_rate(
             classification
         )
@@ -1496,19 +1582,16 @@ def build_assessment(
         agreement_metrics[f"{agreement.provider}.classification_denominator"] = str(
             agreement.classification_denominator
         )
-        agreement_metrics[f"{agreement.provider}.availability_agreement"] = format_rate(
-            availability
+        agreement_metrics[f"{agreement.provider}.coverage_completeness"] = format_rate(
+            agreement.coverage_rate
         )
-        agreement_metrics[f"{agreement.provider}.availability_numerator"] = str(
-            agreement.availability_numerator
-        )
-        agreement_metrics[f"{agreement.provider}.availability_denominator"] = str(
-            agreement.availability_denominator
+        agreement_metrics[f"{agreement.provider}.covered_positions"] = str(
+            agreement.covered_positions
         )
         agreement_metrics[f"{agreement.provider}.indeterminate"] = str(
             agreement.indeterminate_count
         )
-        if not (at_least(classification, minimum) and at_least(availability, minimum)):
+        if not at_least(classification, minimum):
             agreement_ok = False
     agreement_metrics["combined_inference_agreement"] = format_rate(combined_agreement.rate)
     agreement_metrics["combined_inference_numerator"] = str(combined_agreement.numerator)
@@ -1522,11 +1605,11 @@ def build_assessment(
             passed=agreement_ok,
             detail=(
                 "; ".join(
-                    f"{item.provider} classification="
+                    f"{item.provider} classification agreement="
                     f"{format_percent(item.classification_rate)} "
                     f"({item.classification_numerator}/{item.classification_denominator}), "
-                    f"availability={format_percent(item.availability_rate)} "
-                    f"({item.availability_numerator}/{item.availability_denominator})"
+                    f"coverage={format_percent(item.coverage_rate)} "
+                    f"({item.covered_positions}/{item.scheduled_positions})"
                     for item in provider_agreements
                 )
                 or "no provider agreement could be computed"
@@ -1696,9 +1779,58 @@ def build_assessment(
         )
     )
 
+    # Materiality. Previously this configured value was validated, echoed and
+    # printed but never consumed, which invited a reader to assume the numbers
+    # below had been weighed against it. They now are.
+    materiality = thresholds.materiality_threshold
+    finding_rate = exact_rate(len(findings), spec.scheduled_slot_positions)
+    material_reasons: list[str] = []
+    if finding_rate is not None and not within_threshold(finding_rate, materiality):
+        material_reasons.append(
+            f"{len(findings)} finding(s) over {spec.scheduled_slot_positions} "
+            f"scheduled positions ({format_percent(finding_rate)}) exceeds the "
+            f"materiality threshold {materiality}"
+        )
+    token_rates: dict[str, str] = {}
+    for name, result in sorted(token_results.items()):
+        difference = result.signed_difference
+        if difference is None or not result.mint_supply:
+            token_rates[f"{name}.token_discrepancy_rate"] = "n/a"
+            continue
+        rate = exact_rate(abs(difference), result.mint_supply)
+        token_rates[f"{name}.token_discrepancy_rate"] = format_rate(rate)
+        if not within_threshold(rate, materiality):
+            material_reasons.append(
+                f"{name} token discrepancy of {difference} base units "
+                f"({format_percent(rate)} of supply) exceeds the materiality "
+                f"threshold {materiality}"
+            )
+    gates.append(
+        build_gate(
+            "materiality_assessment",
+            "Observed discrepancies weighed against the configured materiality",
+            passed=not material_reasons,
+            detail=(
+                "; ".join(material_reasons)
+                if material_reasons
+                else f"nothing observed exceeds the materiality threshold {materiality}"
+            ),
+            mandatory=False,
+            metrics={
+                "materiality_threshold": str(materiality),
+                "finding_count": str(len(findings)),
+                "finding_rate": format_rate(finding_rate),
+                "material": str(bool(material_reasons)),
+                **token_rates,
+            },
+        )
+    )
+
     chain_failures = [
-        result for result in continuity if not result.clean
+        result for result in continuity if not (result.clean or result.vacuous)
     ]
+    vacuous = [result for result in continuity if result.vacuous]
+    checked = sum(result.checked for result in continuity)
     gates.append(
         build_gate(
             "hash_link_continuity",
@@ -1709,14 +1841,23 @@ def build_assessment(
                     f"{result.population}: {sorted(result.outcomes)}"
                     for result in chain_failures
                 )
-                or "all validated links matched"
+                or (
+                    f"all {checked} validated link(s) matched"
+                    if checked
+                    else "NO links were validated; this gate establishes nothing"
+                )
             ),
             mandatory=False,
             metrics={
-                result.population: (
-                    f"{result.checked} checked, {len(result.mismatches)} mismatched"
-                )
-                for result in continuity
+                "links_checked": str(checked),
+                "vacuous_populations": ", ".join(item.population for item in vacuous)
+                or "none",
+                **{
+                    result.population: (
+                        f"{result.checked} checked, {len(result.mismatches)} mismatched"
+                    )
+                    for result in continuity
+                },
             },
         )
     )
