@@ -112,6 +112,125 @@ class UnverifiableAnchorTests(EpochAuditTestCase):
         self.assertIn("car_present", summary)
 
 
+class ConstantProvenanceGateTests(EpochAuditTestCase):
+    """The FAIL path of the gate that currently blocks every epoch-100 run.
+
+    Without these, a typo in the gate's ``passed=`` expression or a flipped
+    default on :class:`ConstantProvenance` would silently unblock a run whose
+    anchor traces to nothing, and the suite would stay green.
+    """
+
+    def _unverified(self, epoch):
+        from slot_audit.groundtruth import UNVERIFIED_PROVENANCE
+
+        return dataclasses.replace(
+            epoch, spec=dataclasses.replace(epoch.spec, provenance=UNVERIFIED_PROVENANCE)
+        )
+
+    async def test_unverified_constants_fail_the_gate(self) -> None:
+        epoch = self._unverified(build_simulated_epoch())
+
+        run = await run_audit(directory=self.tmp_path / "unverified", epoch=epoch)
+
+        gate = run.assessment.gate("ground_truth_constants_provenance")
+        self.assertIs(gate.status, GateStatus.FAIL)
+        self.assertTrue(gate.mandatory)
+        self.assertEqual(gate.metrics["verified_against_archive"], "False")
+        self.assertIn("no provenance was recorded", gate.detail)
+
+    async def test_unverified_constants_force_no_conclusion(self) -> None:
+        """Even with a clean archive, a clean chain and zero findings."""
+
+        epoch = self._unverified(build_simulated_epoch())
+
+        run = await run_audit(
+            directory=self.tmp_path / "unverified",
+            epoch=epoch,
+            run_negative_controls=True,
+        )
+
+        # Everything the archive itself can prove still passes ...
+        self.assertTrue(run.ground_truth.verified)
+        self.assertIs(
+            run.assessment.gate("ground_truth_provenance_binding").status,
+            GateStatus.PASS,
+        )
+        self.assertEqual(run.findings, ())
+        # ... and the run still refuses, because the pinned values it verified
+        # against trace to nothing.
+        self.assertIs(run.assessment.status, GateStatus.FAIL)
+        self.assertIs(run.conclusion.result, RunResult.NO_CONCLUSION)
+        self.assertIn("ground_truth_constants_provenance", run.conclusion.blocked_by)
+
+    async def test_unverified_constants_block_an_otherwise_conclusive_finding(
+        self,
+    ) -> None:
+        """The strongest form: a defensible finding that still cannot be reported."""
+
+        from slot_audit.config import ContinuityConfig
+        from slot_audit.negative_controls import run_all_negative_controls
+
+        controls = await run_all_negative_controls(
+            results_dir=self.tmp_path / "controls"
+        )
+        epoch = self._unverified(
+            build_simulated_epoch(
+                epoch=900_500, first_slot=420_000_000, positions=512, produced=384
+            )
+        )
+        target = epoch.produced_slots[100]
+        config = build_control_config(epoch).model_copy(
+            update={
+                "continuity": ContinuityConfig(
+                    hash_link_validation_population="findings_and_adjacent"
+                )
+            }
+        )
+
+        run = await run_audit(
+            directory=self.tmp_path / "blocked",
+            epoch=epoch,
+            config=config,
+            defects={"control-a": LedgerDefects(dropped_slots=frozenset({target}))},
+            negative_controls=controls,
+        )
+
+        self.assertEqual(len(run.findings), 1)
+        self.assertTrue(run.findings[0].complete)
+        self.assertEqual(run.conclusion.blocked_by, ("ground_truth_constants_provenance",))
+        self.assertIs(run.conclusion.result, RunResult.NO_CONCLUSION)
+
+    async def test_the_summary_names_the_unverified_constants(self) -> None:
+        epoch = self._unverified(build_simulated_epoch())
+        directory = self.tmp_path / "unverified"
+
+        run = await run_audit(directory=directory, epoch=epoch)
+        summary = render_summary(run, results_dir=directory)
+
+        self.assertIn("**Result:** `NO_CONCLUSION`", summary)
+        self.assertIn("ground_truth_constants_provenance", summary)
+        self.assertIn("The pinned constants below are unverified", summary)
+
+    def test_the_shipped_epoch_100_constants_are_unverified_today(self) -> None:
+        """Pins the repository's actual state: epoch 100 cannot conclude."""
+
+        from slot_audit.groundtruth import EPOCH_100_GROUND_TRUTH
+
+        self.assertFalse(
+            EPOCH_100_GROUND_TRUTH.provenance.verified_against_archive,
+            "if this ever passes, the constants were verified -- update the README "
+            "status block and this test together",
+        )
+
+    def test_a_verified_provenance_passes_the_same_gate(self) -> None:
+        """The gate must be capable of passing, or it proves nothing."""
+
+        epoch = build_simulated_epoch()
+
+        self.assertTrue(epoch.spec.provenance.verified_against_archive)
+        self.assertIn("computed from the archive bytes", epoch.spec.provenance.note)
+
+
 class MissingGroundTruthHeaderTests(EpochAuditTestCase):
     """Directly exercise the guard that refuses a hole without a header."""
 
@@ -490,7 +609,9 @@ class AbsenceConfirmationTests(EpochAuditTestCase):
         self.assertEqual([finding.slot for finding in run.findings], [target])
         finding = run.findings[0]
         self.assertIn("null block", finding.inference)
-        self.assertIn("second independent read agreed", finding.inference)
+        self.assertIn("confirming re-read against the same endpoint agreed", finding.inference)
+        # The residual limit of an in-band check is stated, not implied.
+        self.assertIn("not an endpoint that consistently returns null", finding.inference)
         self.assertIn("direct_response_confirmation", finding.evidence)
         self.assertTrue(
             (run.evidence_root / finding.evidence["direct_response_confirmation"]
@@ -734,7 +855,7 @@ class ConclusiveFindingRunTests(EpochAuditTestCase):
 
         # The readable copies are the sealed bytes, and the store is intact.
         self.assertTrue(verify_manifest(self.run.evidence_root).ok)
-        self.assertEqual(verify_reports(self.directory, self.run.evidence_root), [])
+        self.assertTrue(verify_reports(self.directory, self.run.evidence_root).ok)
         self.assertIsNotNone(self.run.summary_evidence)
         self.assertIsNotNone(self.run.result_evidence)
 

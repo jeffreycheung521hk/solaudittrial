@@ -146,6 +146,84 @@ class ProbeCarCommandTests(unittest.TestCase):
         self.assertIn("was not found", output)
 
 
+class ReportSealingTests(unittest.IsolatedAsyncioTestCase):
+    """A deleted readable copy and an edited one must read differently."""
+
+    def setUp(self) -> None:
+        self._temporary = TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.tmp_path = Path(self._temporary.name)
+
+    async def _run(self):
+        from slot_audit.negative_controls import build_simulated_epoch, run_control_audit
+        from slot_audit.report import write_reports
+
+        directory = self.tmp_path / "run"
+        run = await run_control_audit(
+            directory=directory,
+            epoch=build_simulated_epoch(),
+            defects_by_provider={},
+        )
+        write_reports(run, results_dir=directory)
+        return run, directory
+
+    async def test_faithful_copies_verify(self) -> None:
+        run, directory = await self._run()
+
+        code, output = _run(
+            ["verify-evidence", "--evidence-dir", str(run.evidence_root)]
+        )
+
+        self.assertEqual(code, EXIT_COMPLETE)
+        self.assertIn("summary.md: matches its sealed copy", output)
+        self.assertIn("result.json: matches its sealed copy", output)
+
+    async def test_an_edited_copy_is_reported_as_modified_and_fails(self) -> None:
+        run, directory = await self._run()
+        (directory / "summary.md").write_text("provider-x lost blocks", encoding="utf-8")
+
+        code, output = _run(
+            ["verify-evidence", "--evidence-dir", str(run.evidence_root)]
+        )
+
+        self.assertEqual(code, EXIT_FAILED)
+        self.assertIn("summary.md: DIFFERS", output)
+        self.assertNotIn("summary.md: NOT PRESENT", output)
+
+    async def test_a_deleted_copy_is_reported_distinctly_and_does_not_fail(
+        self,
+    ) -> None:
+        """The sealed original is intact, so this is recoverable -- but visible."""
+
+        run, directory = await self._run()
+        (directory / "summary.md").unlink()
+
+        code, output = _run(
+            ["verify-evidence", "--evidence-dir", str(run.evidence_root)]
+        )
+
+        self.assertEqual(code, EXIT_COMPLETE)
+        self.assertIn("summary.md: NOT PRESENT", output)
+        self.assertIn("can be restored from it", output)
+        self.assertNotIn("summary.md: DIFFERS", output)
+
+    async def test_the_sealed_result_explains_its_own_null_provenance(self) -> None:
+        import json as _json
+
+        run, directory = await self._run()
+        payload = _json.loads(
+            (directory / "result.json").read_text(encoding="utf-8")
+        )
+
+        # These are null by construction, and the document says so rather than
+        # leaving a downstream parser to infer an incomplete run.
+        self.assertIsNone(payload["manifest"])
+        self.assertIsNone(payload["provenance"]["run_completed_at"])
+        self.assertIn("by construction, not by omission", payload["sealing_note"])
+        self.assertIn("provenance.json", payload["sealing_note"])
+        self.assertTrue((run.evidence_root / "provenance.json").is_file())
+
+
 class AuditCommandRefusalTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary = TemporaryDirectory()

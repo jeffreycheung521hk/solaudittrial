@@ -70,10 +70,11 @@ renders it; neither recomputes a gate. Any failed mandatory gate forces
 | `manifest_provenance_completeness` | Evidence is complete, unmodified and fully attributed |
 
 `hash_link_continuity`, `token_supply_reconciliation` and `materiality_assessment`
-are reported but are
-**not** mandatory: their failure is a *finding about the providers*, not a
-malfunction of the instrument, and conflating the two would make every real
-finding suppress its own result.
+are reported but are **not** mandatory: their failure is a *finding about the
+providers*, not a malfunction of the instrument, and conflating the two would
+make every real finding suppress its own result. `materiality_assessment` in
+particular will fail on any run that reports something — that is it doing its
+job, and it does not block the conclusion.
 
 ### The ground-truth trust chain
 
@@ -172,10 +173,13 @@ host fingerprint, and a shared host is rejected: that is one upstream wearing tw
 names.
 
 A conclusive `PROVIDER_HOLE` additionally requires the provider to **answer**
-that it has no block: `-32007`/`-32009`, or a null result confirmed by a second
-independent read. A bare null is a *successful* response, so the transport never
-retries it, and gateway layers have been observed returning one for an edge-cache
-miss on a slot they do hold — one unreplicated null is not enough. A direct
+that it has no block: `-32007`/`-32009`, or a null result confirmed by a re-read.
+A bare null is a *successful* response, so the transport never retries it, and
+gateway layers have been observed returning one for an edge-cache miss on a slot
+they do hold — one unreplicated null is not enough. The re-read is **in-band**:
+same client, same endpoint, seconds later. It catches a transient miss; it cannot
+catch an endpoint that *consistently* returns null for a slot it holds, and no
+same-endpoint check could. Each finding's `inference` text says so. A direct
 `getBlock` that failed for any other reason — an exhausted request budget, a
 transport fault, a node that never became healthy, or `-32001` "below retention"
 — is the audit failing to ask, not the provider failing to serve. Those record an
@@ -191,7 +195,12 @@ hashes.
 
 `summary.md` and `result.json` are themselves manifested artifacts. The copies
 beside the evidence directory are byte-identical to the sealed ones, so editing
-the readable conclusion is detectable — `verify-evidence` compares them.
+the readable conclusion is detectable — `verify-evidence` compares them and
+distinguishes a modified copy (a failure) from a deleted one (recoverable from
+the sealed original, but reported). Because sealing must happen before the
+manifest closes, the sealed `result.json` necessarily carries a null `manifest`
+and a null `provenance.run_completed_at`; it says so in its own `sealing_note`,
+and the completed values live in `provenance.json` and `manifest.json`.
 
 Manifest verification is closed-world (missing, modified **and** unexpected
 unmanifested files), and a store refuses to open on a directory that already
@@ -308,6 +317,15 @@ against the published epoch-100 CAR in this environment, and the run records
 against the real archive first: it will say factually whether the shape is
 present. If it is not, this build cannot anchor that archive, the produced-block
 count gate fails, and the run correctly concludes nothing.
+
+Residual assumptions worth knowing before citing any future finding:
+
+- The null confirmation re-read is in-band. An endpoint that consistently
+  returns null for a slot it holds would still produce a conclusive finding.
+- The evidence manifest is unsigned. It detects damage and naive edits, not a
+  forger with write access who also rewrites the manifest.
+- Pass A rows are never confirmations of anything, whatever they look like in
+  bulk.
 
 Beyond that: measuring block presence does not establish that anyone was harmed
 by a missing block. This audit does not prove transaction-level completeness,

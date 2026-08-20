@@ -33,7 +33,7 @@ from .config import (
 from .enumerate import (
     MAX_GET_BLOCKS_SLOTS,
     ChunkEnumeration,
-    CrossProviderHole,
+    CrossProviderOmission,
     ProviderEnumeration,
     apply_retention_boundary,
     enumerate_provider,
@@ -169,7 +169,7 @@ def _atomic_write_json(path: Path, value: object) -> None:
 
 def _stream_cross_provider_rows(
     output_dir: Path,
-    findings: Iterable[CrossProviderHole],
+    findings: Iterable[CrossProviderOmission],
     *,
     epoch_schedule: EpochSchedule | None,
     checked_at: str,
@@ -1109,13 +1109,13 @@ def verify_evidence_command(evidence_dir: str, results_dir: str | None = None) -
     print(verification.describe())
 
     reports_dir = Path(results_dir) if results_dir else Path(evidence_dir).parent
-    problems = verify_reports(reports_dir, evidence_dir)
-    if problems:
-        for problem in problems:
-            print(f"report verification failed: {problem}")
-    else:
-        print("readable reports match their sealed copies")
-    return EXIT_COMPLETE if verification.ok and not problems else EXIT_FAILED
+    reports = verify_reports(reports_dir, evidence_dir)
+    lines = reports.describe()
+    for line in lines:
+        print(line)
+    if not lines:
+        print("no readable report copies were found or sealed")
+    return EXIT_COMPLETE if verification.ok and reports.ok else EXIT_FAILED
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -536,8 +536,15 @@ BELOW_RETENTION_RPC_CODE = -32001
 #: A bare ``null`` is a *successful* response, so the transport never retries it.
 #: Solana defines it as "block not confirmed", but gateway layers have been known
 #: to return it for an edge-cache miss on a slot they do hold. One unretried read
-#: is therefore not enough to found a conclusive finding on, and a second
-#: independent read is required before a null is accepted as a denial.
+#: is therefore not enough, and a confirming re-read is required before a null is
+#: accepted as a denial.
+#:
+#: The re-read is **in-band**: same client, same endpoint, seconds later. It
+#: catches a transient miss, which is the failure mode it exists for. It cannot
+#: catch a gateway that consistently returns null for a slot it holds -- no
+#: same-endpoint check can. That residual assumption is stated in the finding's
+#: own inference text so a reader is not left to infer a stronger check than was
+#: performed.
 NULL_CONFIRMATION_READS = 2
 
 
@@ -754,6 +761,16 @@ class AuditRun:
             "request_stats": [item.to_payload() for item in self.request_stats],
             "assessment": self.assessment.to_payload(),
             "manifest": None if self.manifest is None else self.manifest.to_payload(),
+            "sealing_note": (
+                "This copy was serialized before the evidence manifest closed -- "
+                "which is precisely what allows it to be sealed inside that "
+                "manifest. `manifest` and `provenance.run_completed_at` are "
+                "therefore null here by construction, not by omission. The "
+                "completed provenance is in provenance.json and the manifest "
+                "digest in manifest.json, both alongside this file."
+                if self.manifest is None
+                else "This copy was serialized after the manifest closed."
+            ),
             "sealed_reports": {
                 "summary": (
                     None if self.summary_evidence is None
@@ -1251,23 +1268,26 @@ async def build_findings(
             confirmed, absence_detail, basis = confirms_absence(direct)
             if confirmed and basis == "null":
                 # A null is not retried by the transport, so a single one is a
-                # single unreplicated observation. Read again before founding a
-                # conclusive finding on it.
+                # single unreplicated observation. Re-read before founding a
+                # conclusive finding on it. In-band only; see the note on
+                # NULL_CONFIRMATION_READS for what that cannot establish.
                 second = await clients[provider].get_block(slot)
                 refs["direct_response_confirmation"] = second.raw_ref
                 again, second_detail, second_basis = confirms_absence(second)
                 if not again:
                     confirmed = False
                     absence_detail = (
-                        "the first direct read returned null but an independent "
-                        f"confirming read did not agree ({second_detail}); a single "
+                        "the first direct read returned null but a confirming "
+                        f"re-read did not agree ({second_detail}); a single "
                         "unreplicated null is not evidence that the provider lacks "
                         "the block"
                     )
                 else:
                     absence_detail = (
-                        f"{absence_detail}, and a second independent read agreed "
-                        f"({second_basis})"
+                        f"{absence_detail}, and a confirming re-read against the "
+                        f"same endpoint agreed ({second_basis}). Both reads are "
+                        "in-band, so this rules out a transient miss but not an "
+                        "endpoint that consistently returns null for a slot it holds"
                     )
             if not confirmed:
                 indeterminate.append(

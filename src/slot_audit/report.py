@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .assessment import GateStatus
@@ -459,13 +460,56 @@ def _sealed_bytes(run: AuditRun, ref: EvidenceRef | None) -> bytes | None:
     return path.read_bytes() if path.is_file() else None
 
 
-def verify_reports(results_dir: str | Path, evidence_dir: str | Path) -> list[str]:
-    """Compare the readable copies against the sealed originals.
+@dataclass(frozen=True, slots=True)
+class ReportVerification:
+    """The state of each readable report against its sealed original.
 
-    Returns a list of problems; an empty list means the copies are faithful.
+    A missing copy and an edited copy are different events and are reported as
+    such. Only an edited or unsealed copy is a failure: a copy that was never
+    written, or was deleted, leaves the sealed original untouched and is
+    recoverable -- but a reader still needs to be told which happened.
     """
 
-    problems: list[str] = []
+    matched: tuple[str, ...] = ()
+    modified: tuple[str, ...] = ()
+    absent: tuple[str, ...] = ()
+    unsealed: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not (self.modified or self.unsealed)
+
+    def describe(self) -> list[str]:
+        lines: list[str] = []
+        for name in self.matched:
+            lines.append(f"{name}: matches its sealed copy")
+        for name in self.absent:
+            lines.append(
+                f"{name}: NOT PRESENT beside the evidence; the sealed copy in "
+                f"artifacts/{name} is intact and can be restored from it"
+            )
+        for name in self.modified:
+            lines.append(
+                f"{name}: DIFFERS from the sealed artifacts/{name}; the readable "
+                "copy has been modified"
+            )
+        for name in self.unsealed:
+            lines.append(
+                f"{name}: present beside the evidence but never sealed; it cannot "
+                "be checked against anything"
+            )
+        return lines
+
+
+def verify_reports(
+    results_dir: str | Path, evidence_dir: str | Path
+) -> ReportVerification:
+    """Compare the readable copies against the sealed originals."""
+
+    matched: list[str] = []
+    modified: list[str] = []
+    absent: list[str] = []
+    unsealed: list[str] = []
     results = Path(results_dir)
     evidence = Path(evidence_dir)
     for name in (SUMMARY_NAME, RESULT_NAME):
@@ -473,21 +517,26 @@ def verify_reports(results_dir: str | Path, evidence_dir: str | Path) -> list[st
         sealed = evidence / "artifacts" / name
         if not sealed.is_file():
             if copy.is_file():
-                problems.append(f"{name} exists beside the evidence but was never sealed")
+                unsealed.append(name)
             continue
         if not copy.is_file():
-            continue
-        if copy.read_bytes() != sealed.read_bytes():
-            problems.append(
-                f"{name} differs from the sealed artifacts/{name}; the readable copy "
-                "has been modified"
-            )
-    return problems
+            absent.append(name)
+        elif copy.read_bytes() != sealed.read_bytes():
+            modified.append(name)
+        else:
+            matched.append(name)
+    return ReportVerification(
+        matched=tuple(matched),
+        modified=tuple(modified),
+        absent=tuple(absent),
+        unsealed=tuple(unsealed),
+    )
 
 
 __all__ = [
     "RESULT_NAME",
     "SUMMARY_NAME",
+    "ReportVerification",
     "render_result_bytes",
     "render_summary",
     "verify_reports",

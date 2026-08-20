@@ -359,9 +359,9 @@ class CrossProviderOmission:
         }
 
 
-#: Retained so existing callers keep importing successfully. The old name made a
-#: claim the class never supported.
-CrossProviderHole = CrossProviderOmission
+# There is deliberately no `CrossProviderHole` alias. Keeping the old name
+# importable would keep the over-claim reachable, and this package has no
+# external callers to spare.
 
 
 CheckpointCallback: TypeAlias = Callable[[ChunkEnumeration], Awaitable[None] | None]
@@ -572,7 +572,7 @@ def iter_cross_provider_holes(
 
 def cross_provider_diff(
     enumerations: Iterable[ProviderEnumeration],
-) -> tuple[CrossProviderHole, ...]:
+) -> tuple[CrossProviderOmission, ...]:
     """Materialize :func:`iter_cross_provider_holes` for small/reporting use."""
 
     return tuple(iter_cross_provider_holes(enumerations))
@@ -764,7 +764,6 @@ __all__ = [
     "UNEXCLUDED_EXPLANATIONS",
     "CheckpointCallback",
     "ChunkEnumeration",
-    "CrossProviderHole",
     "CrossProviderOmission",
     "EnumerationClient",
     "ProviderEnumeration",
