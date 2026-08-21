@@ -47,12 +47,16 @@ to review correspondence are marked **⚠ PENDING** and are not written as
 established fact. That mark is not a doubt about the reviewer; it is the same
 standard the code is held to, applied to its own history.
 
-Three marks remain, on `F3`, `H1` and `E5` — searching the document for the
-mark also finds this paragraph and the one above it, which are about the mark
-rather than instances of it. Each of the three names a demonstration the review
-ran by hand whose script is not in this repository. For `F3` and `H1` the
-repository carries a stronger equivalent, named in the entry itself; `E5` is a
-statement about the correspondence and cannot be anything else.
+Four marks remain. The list names them rather than counting them, so a reader
+checks it by reading the entries, not by trusting a number:
+
+- `F3` and `H1` — a demonstration the review ran by hand whose script is not in
+  this repository. In both cases the repository carries a stronger equivalent,
+  named in the entry itself.
+- `E5` — a statement about the correspondence, which cannot be anything else.
+- One specimen listed in [`P3`](#p3--output-that-looks-right-is-not-evidence-the-thing-happened)
+  — a drafting error caught before it was committed, so no artifact of it
+  exists.
 
 Two earlier marks are closed rather than explained. The construction behind
 `F7` is reproducible in
@@ -700,8 +704,35 @@ stdin. The merge did not occur. The surrounding verification output looked
 normal, and the failure was detected only because the test count printed
 afterwards was 293 rather than the expected 243.
 
+Three more specimens followed, all inside this document, and they get finer:
+
+- **The front-matter arithmetic.** "Twenty-four claims tested. Fourteen did not
+  hold; ten held" could not be derived from the sections beneath it: section 1
+  carries 24 labels, section 2 carries 10, and no stated rule produced 14.
+  `git show 7810f80:REVIEW-LOG.md | sed -n '6,9p'`, corrected in `f09401f`.
+- **A count that counted itself.** The tally of remaining marks in the sourcing
+  rule was first written as a `grep -c` command whose own line contained the
+  string it searched for, so it returned one more than the sentence claimed.
+  ⚠ PENDING — caught in draft and never committed, so this description is the
+  only record of it.
+- **Its replacement, wrong in the other direction.** The prose that replaced it
+  said a search for the mark "also finds this paragraph and the one above it".
+  That paragraph names the mark without using it, so only one of the two hits
+  it claimed exists. Shipped in `f09401f` and found by review:
+  `git show f09401f:REVIEW-LOG.md | grep -n "and the one above it"`.
+
 **Countermeasure.** Verify by observing the state that should have changed, not
 by the absence of an error message.
+
+A sentence about a count is the hardest sentence in a document, because it can
+change what it counts. The review proposed an accurate one-line repair for the
+third specimen; the sentence was removed instead. Any sentence counting
+occurrences of a string inside the document that contains it becomes false the
+moment someone adds one — as the second bullet above did, which is why the
+sourcing rule's tally went from three to four in the same commit that recorded
+this pattern. The rule now lists the marks by name instead. A count that
+enumerates its members can be checked by reading; a count that asserts the
+result of a search cannot.
 
 ### P4 — Structural absence of identity produces structural absence of tests
 
@@ -726,6 +757,7 @@ autobiography, not a review record.
 | E2 | The share of `cli.py` belonging to the reconnaissance pass was estimated at "about half the module", and that estimate is preserved in the body of `0439147` itself. The actual figure was 976 lines deleted of 1,236, leaving 274 | `git show 0439147 --format="" --numstat -- src/slot_audit/cli.py` → `14  976`; the erroneous estimate: `git log -1 0439147 --format=%B \| grep "about half"` | The commit body is not amended — history is forward-only, and this row is the correction |
 | E3 | A commit message claimed `transport.py` read the Solana code table directly. It read it through a re-export in `rpc.py`, because the patch making the import direct sat after an assertion that aborted the script | Self-corrected in `c764757` | Behaviour was already right; the coupling was not. `c764757` also extracted `TokenBucket` so the two subsystems shared no module |
 | E4 | `git merge -F -` was used to supply a merge message from stdin, which `git merge` does not support. The merge silently did not happen | See [P3](#p3--output-that-looks-right-is-not-evidence-the-thing-happened) | Detected by the test count, not by the error line |
+| E7 | A sentence in the sourcing rule claimed that searching for the pending mark "also finds this paragraph and the one above it". Only the paragraph above contains the mark; the sentence describing it does not. This was the second consecutive wrong answer to the same count | `git show f09401f:REVIEW-LOG.md \| grep -n "and the one above it"`; the pattern and its three siblings are in [P3](#p3--output-that-looks-right-is-not-evidence-the-thing-happened) | Found by review. The sentence was removed rather than repaired, because the class of sentence is fragile, not just this instance |
 
 ### Reviewer
 
