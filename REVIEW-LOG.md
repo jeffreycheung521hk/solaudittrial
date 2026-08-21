@@ -47,7 +47,7 @@ to review correspondence are marked **⚠ PENDING** and are not written as
 established fact. That mark is not a doubt about the reviewer; it is the same
 standard the code is held to, applied to its own history.
 
-Four marks remain. The list names them rather than counting them, so a reader
+Five marks remain. The list names them rather than counting them, so a reader
 checks it by reading the entries, not by trusting a number:
 
 - `F3` and `H1` — a demonstration the review ran by hand whose script is not in
@@ -57,6 +57,8 @@ checks it by reading the entries, not by trusting a number:
 - One specimen listed in [`P3`](#p3--output-that-looks-right-is-not-evidence-the-thing-happened)
   — a drafting error caught before it was committed, so no artifact of it
   exists.
+- The attribution on the [preflight acceptance criteria](#acceptance-criteria-for-the-live-preflight)
+  — the criteria themselves are now an artifact; who proposed them is not.
 
 Two earlier marks are closed rather than explained. The construction behind
 `F7` is reproducible in
@@ -662,7 +664,33 @@ Raised in review, not built. Recorded so the reasoning is inspectable.
 | --- | --- | --- |
 | Anchor bundle | Derive the anchor once into a cacheable, sealed bundle so `audit` consumes the bundle rather than the archive | Depends on L2. Caching an anchor that cannot currently conclude buys nothing |
 | Summary as a pure function | Seal only `result.json`; define `summary.md` as `render(result.json)` and have `verify-evidence` re-render and diff | Cleaner than the current sealing, but would redo the just-verified F5 fix. The `.get()`-chain fragility it also names is a real separate defect and is **not fixed** |
-| Live preflight | A fourth control that probes real endpoints for the behaviours `confirms_absence` assumes, and gates on the result | The next item of work. It closes L7 and narrows L5. It cannot self-verify without a real endpoint |
+| Live preflight | A fourth control that probes real endpoints for the behaviours `confirms_absence` assumes, and gates on the result | The next item of work. It closes L7 and narrows L5. It cannot self-verify without a real endpoint. Its acceptance criteria are fixed below |
+
+### Acceptance criteria for the live preflight
+
+Written before the work starts, which is the whole of their value. Criteria
+written afterwards are not criteria; they are a description of whatever got
+built. That is the shape of `F2` — reconciling a figure against a file you
+already hold inverts the check rather than satisfying it.
+
+1. **Probe responses are evidence, not log lines.** Every observation the
+   preflight makes enters the same evidence store under the same discipline as
+   an audit run: raw bytes retained, hashed, manifested, endpoint recorded as a
+   fingerprint and never as a URL.
+2. **Behaviour outside the code table fails closed.** An observed response the
+   table does not describe blocks the conclusion. It is not recorded as a
+   warning and carried past.
+3. **The provenance upgrade is scoped to what was probed.** `solana_codes` may
+   move from "transcribed" to "observed consistent against endpoints X and Y on
+   a stated date". It may not move to "verified against Solana". Two endpoints
+   are not the protocol, and `L7` narrows rather than closes.
+4. **Noise and kill-tests ship in the preflight's first commit.** The
+   tidy-fixture pattern in [`P1`](#p1--tidy-fixtures-hide-the-defects-that-matter)
+   has hit this repository three times. A new subsystem gets no grace period.
+
+⚠ PENDING — these came from the review, and that attribution traces only to
+correspondence. The ordering is verifiable: this entry precedes any preflight
+commit in this history.
 
 ---
 
@@ -758,6 +786,7 @@ autobiography, not a review record.
 | E3 | A commit message claimed `transport.py` read the Solana code table directly. It read it through a re-export in `rpc.py`, because the patch making the import direct sat after an assertion that aborted the script | Self-corrected in `c764757` | Behaviour was already right; the coupling was not. `c764757` also extracted `TokenBucket` so the two subsystems shared no module |
 | E4 | `git merge -F -` was used to supply a merge message from stdin, which `git merge` does not support. The merge silently did not happen | See [P3](#p3--output-that-looks-right-is-not-evidence-the-thing-happened) | Detected by the test count, not by the error line |
 | E7 | A sentence in the sourcing rule claimed that searching for the pending mark "also finds this paragraph and the one above it". Only the paragraph above contains the mark; the sentence describing it does not. This was the second consecutive wrong answer to the same count | `git show f09401f:REVIEW-LOG.md \| grep -n "and the one above it"`; the pattern and its three siblings are in [P3](#p3--output-that-looks-right-is-not-evidence-the-thing-happened) | Found by review. The sentence was removed rather than repaired, because the class of sentence is fragile, not just this instance |
+| E8 | This log quoted a sentence as coming "from `c768982`" that `c768982` does not contain, and that no commit message in the history at the time contained. It came from a review report. `F6` carried it from `7810f80` until `f09401f`. Misattribution is worse than an unmarked claim: it manufactures provenance rather than merely lacking it | `git show 7810f80:REVIEW-LOG.md \| grep -n "naturally infers"` → line 207, and it appears in no commit message that existed when it was written: `git log 7810f80 --format=%H \| while read h; do git log -1 --format=%B "$h" \| grep -q "naturally infers" && echo "$h"; done` → no output. The sweep must be scoped to `7810f80`: run over all history it now returns `f09401f`, which quotes the sentence in order to describe this defect | Found by review. Fixed in `f09401f` by quoting what the commit actually says and sourcing the reader-facing half of the defect separately. This row was added after the fix shipped rather than with it — a smaller instance of the same lapse. The commit that added it: `git log -S"naturally infers" --oneline -- REVIEW-LOG.md` |
 
 ### Reviewer
 
