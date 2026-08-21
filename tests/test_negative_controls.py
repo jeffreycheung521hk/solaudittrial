@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
+from slot_audit import audit
 from slot_audit.assessment import GateStatus
 from slot_audit.continuity import LinkOutcome
 from slot_audit.evidence import verify_manifest
@@ -374,3 +377,135 @@ class ShippedControlSuiteTests(ControlTestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ControlSensitivityTests(ControlTestCase):
+    """Each control must go blind when the code it watches is sabotaged.
+
+    A control reporting ``detected=True`` can be right for the wrong reason. If
+    a refactor blunted the production path a control exercises, the control
+    would keep passing while no longer proving anything -- an instrument that
+    has quietly stopped measuring is worse than one that is visibly broken.
+
+    Each test below breaks the one production function that control depends on,
+    in the way a plausible regression would, and requires the control to report
+    ``detected=False`` *and* to name the sabotage in its observed payload. A
+    mutation that stops flipping a control means that control has stopped
+    depending on the code it claims to exercise.
+
+    The sabotage is confined to a ``mock.patch`` context and the call counter is
+    asserted, so a patch that silently misses its call site fails loudly here
+    rather than being read as a passing control.
+    """
+
+    async def test_the_hole_control_goes_blind_if_holes_become_protocol_skips(
+        self,
+    ) -> None:
+        original = audit.classify_epoch
+        calls: list[int] = []
+
+        def misclassify(**kwargs: object) -> object:
+            calls.append(1)
+            tally = original(**kwargs)  # type: ignore[arg-type]
+            return replace(
+                tally,
+                candidate_holes=tuple(
+                    replace(
+                        outcome,
+                        verdicts={
+                            name: (
+                                Verdict.PROTOCOL_SKIPPED
+                                if verdict is Verdict.PROVIDER_HOLE
+                                else verdict
+                            )
+                            for name, verdict in outcome.verdicts.items()
+                        },
+                    )
+                    for outcome in tally.candidate_holes
+                ),
+            )
+
+        with mock.patch.object(audit, "classify_epoch", misclassify):
+            result = await control_removed_known_block(directory=self.tmp_path / "hole")
+
+        self.assertTrue(calls, "the mutation never reached classify_epoch")
+        self.assertFalse(
+            result.detected,
+            "the control still reported detection after every PROVIDER_HOLE was "
+            f"relabelled a protocol skip: {result.detail}",
+        )
+        self.assertEqual(result.observed["verdict"], Verdict.PROTOCOL_SKIPPED.value)
+        self.assertIs(result.observed["became_protocol_skipped"], True)
+
+    async def test_the_token_control_goes_blind_if_the_shortfall_is_absorbed(
+        self,
+    ) -> None:
+        original = audit.reconcile_mint
+        calls: list[int] = []
+
+        def absorb(**kwargs: object) -> object:
+            calls.append(1)
+            reconciliation = original(**kwargs)  # type: ignore[arg-type]
+            if reconciliation.mint_supply is None:
+                return reconciliation
+            return replace(reconciliation, enumerated_total=reconciliation.mint_supply)
+
+        with mock.patch.object(audit, "reconcile_mint", absorb):
+            result = await control_truncated_token_enumeration(
+                directory=self.tmp_path / "token"
+            )
+
+        self.assertTrue(calls, "the mutation never reached reconcile_mint")
+        self.assertFalse(
+            result.detected,
+            "the control still reported detection after the enumerated total was "
+            f"forced to equal the declared supply: {result.detail}",
+        )
+        self.assertEqual(
+            set(result.observed["observed_signed_differences"].values()),  # type: ignore[union-attr]
+            {0},
+        )
+        self.assertLess(result.observed["expected_signed_difference"], 0)  # type: ignore[operator]
+
+    async def test_the_continuity_control_goes_blind_if_mismatches_report_ok(
+        self,
+    ) -> None:
+        original = audit.validate_hash_links
+        calls: list[int] = []
+
+        def swallow(*args: object, **kwargs: object) -> object:
+            calls.append(1)
+            outcome = original(*args, **kwargs)  # type: ignore[arg-type]
+            return replace(
+                outcome,
+                links=tuple(
+                    replace(link, outcome=LinkOutcome.OK)
+                    if link.outcome is LinkOutcome.PREVIOUS_BLOCKHASH_MISMATCH
+                    else link
+                    for link in outcome.links
+                ),
+            )
+
+        with mock.patch.object(audit, "validate_hash_links", swallow):
+            result = await control_corrupted_previous_blockhash(
+                directory=self.tmp_path / "chain"
+            )
+
+        self.assertTrue(calls, "the mutation never reached validate_hash_links")
+        self.assertFalse(
+            result.detected,
+            "the control still reported detection after every blockhash mismatch "
+            f"was relabelled OK: {result.detail}",
+        )
+        self.assertEqual(result.observed["mismatch_count"], 0)
+        self.assertIs(result.observed["silently_passed"], True)
+        self.assertEqual(
+            result.observed["continuity_gate_status"], GateStatus.PASS.value
+        )
+
+    async def test_the_unsabotaged_controls_still_detect(self) -> None:
+        results = await run_all_negative_controls(results_dir=self.tmp_path / "clean")
+
+        for item in results:
+            with self.subTest(control=item.control_id):
+                self.assertTrue(item.detected, item.detail)

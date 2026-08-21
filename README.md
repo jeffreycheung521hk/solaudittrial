@@ -120,6 +120,14 @@ records whether that scenario drives the full orchestration or re-assesses a
 crafted input. Adding a mandatory gate without a failure test breaks the build —
 which is the specific gap that shipped once and had to be caught by review.
 
+The same question is asked of the controls themselves. A control reporting
+`detected=True` could be right for the wrong reason, so
+`tests/test_negative_controls.py::ControlSensitivityTests` breaks
+`classify_epoch`, `reconcile_mint` and `validate_hash_links` in turn — the way a
+plausible regression would — and requires the matching control to go blind and
+to name the sabotage in what it observed. A control that has quietly stopped
+depending on the code it claims to exercise fails there.
+
 `hash_link_continuity`, `token_supply_reconciliation` and `materiality_assessment`
 are reported but are **not** mandatory: their failure is a *finding about the
 providers*, not a malfunction of the instrument, and conflating the two would
@@ -314,11 +322,13 @@ cp .env.example .env
 
 ## Review history
 
-`REVIEW-LOG.md` records four rounds of adversarial review: twenty-four claims
-tested, fourteen corrected, ten that held, eight limits that remain. It is
-organised by finding, and every entry cites the commit, test name or command
-that substantiates it — statements traceable only to correspondence are marked
-pending rather than written as fact. The error log records both sides.
+`REVIEW-LOG.md` records four rounds of adversarial review: thirty-four claims
+and design decisions examined, twenty-four changed, ten that held, eight limits
+that remain — the log states how those numbers are counted so they can be
+checked against its own headings. It is organised by finding, and every entry
+cites the commit, test name or command that substantiates it; statements
+traceable only to correspondence are marked pending rather than written as
+fact. The error log records both sides.
 
 ## Fixtures are deliberately messy
 

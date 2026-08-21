@@ -4,9 +4,22 @@ This tool exists to keep claims inside the evidence that supports them. This
 document applies the same rule to the tool's own development.
 
 Four rounds of adversarial review ran against this repository between
-2026-08-20 and 2026-08-21. Twenty-four claims the code or its documentation
-made were tested. Fourteen did not hold and were corrected; ten were attacked
-and held; eight limits remain, stated rather than removed.
+2026-08-20 and 2026-08-21. Thirty-four claims and design decisions were
+examined. Twenty-four did not survive and were changed; ten were attacked and
+held; eight limits remain, stated rather than removed.
+
+**How those numbers are counted**, so a reader can check them against the
+headings rather than take them on trust. The twenty-four are the labels in
+[section 1](#1-claims-that-did-not-hold): `F1`–`F10` from the first round,
+`R1`–`R5` from the second, `H1`–`H3` from the third round's re-verification,
+and `A1`–`A6`. The A entries are architectural findings rather than falsified
+claims — nothing the code said was untrue, but each named a design that cost
+the instrument something and each was changed, so they are counted and kept
+alongside the rest. `R2`–`R5` share one heading, which is why section 1 carries
+21 headings for 24 labels, and `F10` is one label covering four smaller
+defects, listed individually in its table. The ten that held are the ten rows
+of the table in [section 2](#2-claims-that-were-attacked-and-held). The eight
+limits are `L1`–`L8` in [section 3](#3-limits-that-remain).
 
 ## How to read an entry
 
@@ -33,6 +46,19 @@ commit, a test name, or a command anyone can re-run. Statements that trace only
 to review correspondence are marked **⚠ PENDING** and are not written as
 established fact. That mark is not a doubt about the reviewer; it is the same
 standard the code is held to, applied to its own history.
+
+Three marks remain, on `F3`, `H1` and `E5` — searching the document for the
+mark also finds this paragraph and the one above it, which are about the mark
+rather than instances of it. Each of the three names a demonstration the review
+ran by hand whose script is not in this repository. For `F3` and `H1` the
+repository carries a stronger equivalent, named in the entry itself; `E5` is a
+statement about the correspondence and cannot be anything else.
+
+Two earlier marks are closed rather than explained. The construction behind
+`F7` is reproducible in
+[Appendix B](#appendix-b--reproducing-the-checks-cited-here), and the control
+kill-tests behind [section 2](#2-claims-that-were-attacked-and-held) are now
+`tests/test_negative_controls.py::ControlSensitivityTests`.
 
 Commands used below assume `PYTHONPATH=src` and the project's virtualenv.
 
@@ -203,10 +229,16 @@ and printed in the summary.
 
 **Attacked.** `read` — no gate, comparison or branch referenced it.
 
-**Failure.** From `c768982`: "summary.md prints 'Materiality threshold: 0.0001',
-a reader naturally infers the token difference was weighed against it; no such
-judgment existed." A required-but-ignored value is the mirror image of a silent
+**Failure.** From `c768982`: "materiality_threshold was required, validated,
+printed and never consumed." It was rendered in the summary's threshold block
+between `indeterminate_threshold` and `minimum_provider_agreement`, both of
+which did drive gates, so its presence in that list implied a judgment that no
+code made. A required-but-ignored value is the mirror image of a silent
 default.
+
+*Sources.* `git show 9af7707:src/slot_audit/report.py | sed -n '84,87p'` for the
+print; at that commit the name appeared in no module that could consume it
+(Appendix B carries the traversal).
 
 **Fixed.** `c768982` added the `materiality_assessment` gate over the finding
 rate and the token discrepancy.
@@ -222,10 +254,12 @@ which is it working, and it does not block the conclusion
 **Claim.** `InstrumentAssessment.__post_init__` enforced that all mandatory
 gates were present.
 
-**Attacked.** `executed` — the review reported constructing an assessment whose
-`per_provider_agreement` gate was `FAIL` but `mandatory=False`, and observing
-`status=PASS`, `result=FINDINGS`. ⚠ PENDING — that construction is not in this
-repository; the guard against it is.
+**Attacked.** `executed` — an assessment whose `per_provider_agreement` gate is
+`FAIL` but `mandatory=False` constructs without complaint at `9af7707` and
+reports `status: PASS result: FINDINGS`. The review found this by hand; the
+reproduction in [Appendix B](#appendix-b--reproducing-the-checks-cited-here)
+builds that assessment in a worktree at `9af7707`, and the same script run
+against `HEAD` raises instead.
 
 **Failure.** Presence was checked; the flag was not. A refactor could have
 demoted a gate and left the suite green.
@@ -536,7 +570,7 @@ These were attacked and did not break.
 | Claim | Attacked | Verify | Verdict |
 | --- | --- | --- | --- |
 | An arbitrary file cannot satisfy the anchor — not by matching a user-supplied digest, not by containing the expected substrings, not by any RPC response | `executed` | `tests/test_groundtruth.py::RejectedAnchorTests` (ten tests) | `Held` |
-| The negative controls traverse the production path, not a parallel one | `executed` | `tests/test_negative_controls.py::ShippedControlSuiteTests::test_a_full_run_gates_on_its_own_controls`. The reviewer additionally reported re-introducing each defect into `classify_epoch`, `reconcile_mint` and `validate_hash_links` and observing all three controls report `detected=False`. ⚠ PENDING — those kill-tests are not in this repository | `Held` |
+| The negative controls traverse the production path, not a parallel one | `executed` | `tests/test_negative_controls.py::ShippedControlSuiteTests::test_a_full_run_gates_on_its_own_controls`, and `::ControlSensitivityTests` — three mutation tests that break `classify_epoch`, `reconcile_mint` and `validate_hash_links` in turn and require the matching control to report `detected=False` *and* to name the sabotage in its observed payload. The reviewer ran the equivalent by hand during round 4; the repository now carries it as a standing regression guard | `Held` |
 | Any failed mandatory gate forces `NO_CONCLUSION`, even with zero findings | `executed` | `tests/test_epoch_audit.py::SingleAssessmentTests::test_zero_findings_with_a_failed_gate_is_still_no_conclusion`; `tests/test_gate_coverage.py::GateFailureExecutionTests` drives all twelve to `FAIL` | `Held` |
 | No credential reaches any output | `executed` | `tests/test_epoch_cli.py::AuditCommandRefusalTests::test_a_refusal_never_echoes_the_credential`; `tests/test_evidence.py::FingerprintTests`; `tests/test_transport.py::ScriptedTransportTests::test_the_request_record_never_holds_the_url` | `Held` |
 | Threshold arithmetic is exact — a configured threshold never becomes a float | `executed` | `tests/test_epoch_audit.py::DecimalThresholdBoundaryTests` — `1/32` against `"0.03125"` passes and against `"0.031249999999999999"` fails, while both convert to the same float | `Held` |
@@ -697,7 +731,7 @@ autobiography, not a review record.
 
 | # | Error | Correction |
 | --- | --- | --- |
-| E5 | A review report stated that `test_config.py` held 8 tests. The figure was an unverified estimate written in the register of fact; the file held 9. ⚠ Source: review correspondence, self-corrected by the reviewer in the following round. Verify the true count: `git show c764757:tests/test_config.py \| grep -c "def test"` → 9 | The reviewer identified this as the same class of error the review had been finding in the code: a claim exceeding its observation |
+| E5 | A review report stated that `test_config.py` held 8 tests. The figure was an unverified estimate written in the register of fact; the file held 9. ⚠ PENDING — the reviewer records the sequence as: the author's accounting contradicted the figure first, and the reviewer then verified and acknowledged it. That ordering is a statement about correspondence and is not reconstructible here — "self-corrected", written without it, credited more than the record supports. What is reconstructible: the contradicting accounting, `git log -1 e58a056 --format=%B \| grep "nine more"`, and the true count, `git show c764757:tests/test_config.py \| grep -c "def test"` → 9 | The reviewer identified this as the same class of error the review had been finding in the code: a claim exceeding its observation |
 | E6 | Two review reports cite commits `8cf09d7` and `a14e1b8`, which are not resolvable in this repository. **This is the author's fault, not the reviewer's**: those commits were rewritten to change an author email address after the reports were written. History has been forward-only since `cbb81ab` | Review reports must cite resolvable hashes; published history is not rewritten |
 
 ---
@@ -730,6 +764,7 @@ PYTHONPATH=src python3 -m unittest tests.test_replay.MessyButHonestRunTests -v
 PYTHONPATH=src python3 -m unittest tests.test_gate_coverage -v
 PYTHONPATH=src python3 -m unittest tests.test_groundtruth.RejectedAnchorTests -v
 PYTHONPATH=src python3 -m unittest tests.test_epoch_audit.ConstantProvenanceGateTests -v
+PYTHONPATH=src python3 -m unittest tests.test_negative_controls.ControlSensitivityTests -v
 ```
 
 Historical claims quoted in section 1, each against the commit that carried it:
@@ -746,6 +781,13 @@ git show 9af7707:tests/test_groundtruth.py     | grep -n "def test_pinned_consta
 # F3 the comment asserting the two denominators differed
 git show 9af7707:src/slot_audit/audit.py | grep -n "denominators distinct"
 
+# F6 the threshold printed among thresholds that did drive gates, and the
+# traversal showing no module that could consume it ever named it
+git show 9af7707:src/slot_audit/report.py | sed -n '84,87p'
+for f in $(git ls-tree -r --name-only 9af7707 -- src | grep '\.py$'); do
+  n=$(git show "9af7707:$f" | grep -ci materiality); [ "$n" -gt 0 ] && echo "$f: $n"
+done   # config.py, report.py, negative_controls.py only -- never audit or assessment
+
 # F5 the unqualified closed-world claim
 git show 9af7707:README.md | grep -n "closed-world"
 
@@ -761,6 +803,30 @@ git show 0439147 --format="" --numstat -- src/slot_audit/cli.py  # 14  976
 # E6 the two unresolvable hashes cited in early review reports
 git cat-file -e 8cf09d7 2>/dev/null || echo "8cf09d7 unresolvable, as recorded"
 git cat-file -e a14e1b8 2>/dev/null || echo "a14e1b8 unresolvable, as recorded"
+```
+
+`F7` — the mandatory gate that could be built advisory. The hole is rebuilt at
+the commit that carried it; the same script against `HEAD` raises
+`ValueError: these gates are mandatory and may not be marked advisory`:
+
+```bash
+git worktree add --detach /tmp/slot-audit-9af7707 9af7707
+cat > /tmp/f7.py <<'EOF'
+from slot_audit.assessment import (
+    MANDATORY_GATES, Gate, GateStatus, InstrumentAssessment, RunConclusion)
+gates = tuple(
+    Gate(gate_id=g, title=g, status=GateStatus.PASS, detail="ok")
+    for g in MANDATORY_GATES if g != "per_provider_agreement"
+) + (Gate(gate_id="per_provider_agreement", title="agreement",
+          status=GateStatus.FAIL, detail="below minimum", mandatory=False),)
+a = InstrumentAssessment(gates=gates)
+print("status:", a.status.value,
+      "result:", RunConclusion(assessment=a, finding_count=1,
+                               indeterminate_count=0).result.value)
+EOF
+PYTHONPATH=/tmp/slot-audit-9af7707/src python3 /tmp/f7.py   # status: PASS result: FINDINGS
+PYTHONPATH=src                              python3 /tmp/f7.py   # ValueError
+git worktree remove --force /tmp/slot-audit-9af7707
 ```
 
 Every test named in this document is in that suite. A claim in this file that
